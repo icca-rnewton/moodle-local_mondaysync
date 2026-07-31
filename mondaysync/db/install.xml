@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<XMLDB PATH="local/mondaysync/db" VERSION="20260723" COMMENT="XMLDB file for Moodle local/mondaysync">
+  <TABLES>
+    <TABLE NAME="local_mondaysync_board" COMMENT="A connected Monday.com board and its matching/mapping configuration">
+      <FIELDS>
+        <FIELD NAME="id" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="true"/>
+        <FIELD NAME="name" TYPE="char" LENGTH="255" NOTNULL="true" SEQUENCE="false"/>
+        <FIELD NAME="boardid" TYPE="char" LENGTH="32" NOTNULL="true" SEQUENCE="false"/>
+        <FIELD NAME="matchingcolumnid" TYPE="char" LENGTH="100" NOTNULL="false" SEQUENCE="false"/>
+        <FIELD NAME="fieldmappings" TYPE="text" NOTNULL="false" SEQUENCE="false"/>
+        <FIELD NAME="enabled" TYPE="int" LENGTH="1" NOTNULL="true" DEFAULT="1" SEQUENCE="false"/>
+        <FIELD NAME="sortorder" TYPE="int" LENGTH="10" NOTNULL="true" DEFAULT="0" SEQUENCE="false"/>
+        <FIELD NAME="suspendedlabelyes" TYPE="char" LENGTH="255" NOTNULL="true" DEFAULT="Suspended" SEQUENCE="false" COMMENT="Text written to Monday.com for a suspended account"/>
+        <FIELD NAME="suspendedlabelno" TYPE="char" LENGTH="255" NOTNULL="true" DEFAULT="Not Suspended" SEQUENCE="false" COMMENT="Text written to Monday.com for a non-suspended account"/>
+        <FIELD NAME="createusers" TYPE="int" LENGTH="1" NOTNULL="true" DEFAULT="0" SEQUENCE="false" COMMENT="Whether this board can create new Moodle accounts"/>
+        <FIELD NAME="createtriggercolumnid" TYPE="char" LENGTH="100" NOTNULL="false" SEQUENCE="false" COMMENT="Monday.com Status column that triggers account creation"/>
+        <FIELD NAME="createfirstnamecolumnid" TYPE="char" LENGTH="100" NOTNULL="false" SEQUENCE="false"/>
+        <FIELD NAME="createlastnamecolumnid" TYPE="char" LENGTH="100" NOTNULL="false" SEQUENCE="false"/>
+        <FIELD NAME="createemailcolumnid" TYPE="char" LENGTH="100" NOTNULL="false" SEQUENCE="false"/>
+        <FIELD NAME="createusernamecolumnid" TYPE="char" LENGTH="100" NOTNULL="false" SEQUENCE="false"/>
+        <FIELD NAME="createdefaultauth" TYPE="char" LENGTH="100" NOTNULL="false" SEQUENCE="false" COMMENT="Auth plugin shortname new accounts are created with"/>
+        <FIELD NAME="createemailpassword" TYPE="int" LENGTH="1" NOTNULL="true" DEFAULT="0" SEQUENCE="false" COMMENT="Whether new manual-auth accounts are emailed a generated password"/>
+        <FIELD NAME="timecreated" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false"/>
+        <FIELD NAME="timemodified" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false"/>
+      </FIELDS>
+      <KEYS>
+        <KEY NAME="primary" TYPE="primary" FIELDS="id"/>
+      </KEYS>
+      <INDEXES>
+        <INDEX NAME="boardid" UNIQUE="true" FIELDS="boardid"/>
+      </INDEXES>
+    </TABLE>
+    <TABLE NAME="local_mondaysync_cache" COMMENT="Last-seen value per Monday.com item/column, used to detect changes between polls">
+      <FIELDS>
+        <FIELD NAME="id" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="true"/>
+        <FIELD NAME="monday_itemid" TYPE="char" LENGTH="32" NOTNULL="true" SEQUENCE="false"/>
+        <FIELD NAME="monday_columnid" TYPE="char" LENGTH="100" NOTNULL="true" SEQUENCE="false"/>
+        <FIELD NAME="value" TYPE="text" NOTNULL="false" SEQUENCE="false"/>
+        <FIELD NAME="timemodified" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false"/>
+      </FIELDS>
+      <KEYS>
+        <KEY NAME="primary" TYPE="primary" FIELDS="id"/>
+      </KEYS>
+      <INDEXES>
+        <INDEX NAME="itemcolumn" UNIQUE="true" FIELDS="monday_itemid, monday_columnid"/>
+      </INDEXES>
+    </TABLE>
+    <TABLE NAME="local_mondaysync_log" COMMENT="Audit log of sync attempts, changes made, and skips/errors">
+      <FIELDS>
+        <FIELD NAME="id" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="true"/>
+        <FIELD NAME="boardid" TYPE="int" LENGTH="10" NOTNULL="false" SEQUENCE="false" COMMENT="local_mondaysync_board.id this entry relates to; null for pre-multi-board history"/>
+        <FIELD NAME="monday_itemid" TYPE="char" LENGTH="32" NOTNULL="true" SEQUENCE="false"/>
+        <FIELD NAME="userid" TYPE="int" LENGTH="10" NOTNULL="false" SEQUENCE="false"/>
+        <FIELD NAME="field" TYPE="char" LENGTH="100" NOTNULL="false" SEQUENCE="false"/>
+        <FIELD NAME="oldvalue" TYPE="text" NOTNULL="false" SEQUENCE="false"/>
+        <FIELD NAME="newvalue" TYPE="text" NOTNULL="false" SEQUENCE="false"/>
+        <FIELD NAME="status" TYPE="char" LENGTH="20" NOTNULL="true" SEQUENCE="false"/>
+        <FIELD NAME="message" TYPE="text" NOTNULL="false" SEQUENCE="false"/>
+        <FIELD NAME="timecreated" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false"/>
+      </FIELDS>
+      <KEYS>
+        <KEY NAME="primary" TYPE="primary" FIELDS="id"/>
+        <KEY NAME="userid" TYPE="foreign" FIELDS="userid" REFTABLE="user" REFFIELDS="id"/>
+        <KEY NAME="boardid" TYPE="foreign" FIELDS="boardid" REFTABLE="local_mondaysync_board" REFFIELDS="id"/>
+      </KEYS>
+      <INDEXES>
+        <INDEX NAME="timecreated" UNIQUE="false" FIELDS="timecreated"/>
+      </INDEXES>
+    </TABLE>
+  </TABLES>
+</XMLDB>
