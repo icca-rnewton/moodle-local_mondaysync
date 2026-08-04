@@ -419,6 +419,24 @@ class sync_manager {
         }
 
         $status = strtolower(trim($item['columns'][$triggercolumnid]['text'] ?? ''));
+
+        if ($status === strtolower(mapping_util::STATUS_CREATED)) {
+            // The only legitimate way this status gets set is a real
+            // account having existed for this row at some point - so
+            // finding no match here means it's gone, almost certainly
+            // deleted directly in Moodle (this plugin never deletes
+            // accounts itself). Flag it rather than silently doing
+            // nothing on every future poll. Reusing fail_creation() gives
+            // this the same anti-repeat property as an ordinary creation
+            // failure: once flipped to "Error", nothing repeats until
+            // someone deliberately resets it.
+            $this->fail_creation($DB, $client, $board, $itemid, $triggercolumnid, $statusindices,
+                'the Moodle account for this row appears to have been deleted - status was "' . mapping_util::STATUS_CREATED .
+                '" but no matching account exists. Set this back to "' . mapping_util::STATUS_CREATE .
+                '" if a fresh account should be created, or you may delete the row from the Monday board.');
+            return;
+        }
+
         if ($status !== strtolower(mapping_util::STATUS_CREATE)) {
             return; // Blank / "Not yet created" / "Error" - just wait for an explicit "Create user".
         }
@@ -501,15 +519,7 @@ class sync_manager {
         }
 
         if ($newuser->auth === 'manual' && !empty($board->createemailpassword)) {
-            try {
-                $createduser = $DB->get_record('user', ['id' => $newuserid], '*', MUST_EXIST);
-                setnew_password_and_mail($createduser);
-            } catch (\Throwable $e) {
-                // The account was created successfully either way - don't
-                // fail the whole creation just because the welcome email
-                // couldn't be sent.
-                mtrace('local_mondaysync: created user ' . $newuserid . ' but failed to email their password: ' . $e->getMessage());
-            }
+            $this->send_manual_password_email_once($DB, $board, $itemid, $newuserid);
         }
 
         if ($statusindices['created'] !== null) {
@@ -537,6 +547,15 @@ class sync_manager {
                 // Swallow - the log entry below is what actually matters here.
             }
         }
+
+        try {
+            $client->create_update($itemid, 'Moodle account creation failed: ' . htmlspecialchars($reason, ENT_QUOTES));
+        } catch (\Throwable $e) {
+            // Best-effort - the Moodle log entry below is the reliable
+            // record either way, this is just a convenience for Ops.
+            mtrace('local_mondaysync: failed to post error update to item ' . $itemid . ': ' . $e->getMessage());
+        }
+
         $this->log($DB, $board->id, $itemid, null, null, null, null, 'error', 'User creation failed - ' . $reason);
     }
 
@@ -599,7 +618,7 @@ class sync_manager {
 
         if ($direction === 'toMoodle') {
             if ($mondayvalue !== $moodlevalue) {
-                $this->apply_to_moodle($user->id, $mapping, $mondayvalue);
+                $this->apply_to_moodle_and_maybe_email($DB, $board, $itemid, $user->id, $mapping, $mondayvalue);
                 $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], $moodlevalue, $mondayvalue, 'updated', null);
             }
             return;
@@ -622,7 +641,7 @@ class sync_manager {
             // mapping would. Avoids a spurious "conflict" purely because
             // there's nothing to compare against yet.
             if ($mondayvalue !== $moodlevalue) {
-                $this->apply_to_moodle($user->id, $mapping, $mondayvalue);
+                $this->apply_to_moodle_and_maybe_email($DB, $board, $itemid, $user->id, $mapping, $mondayvalue);
                 $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], null, $mondayvalue, 'updated', null);
             }
             $this->set_cached_value($DB, $itemid, $columnid, $mondayvalue);
@@ -645,7 +664,7 @@ class sync_manager {
             }
             // Genuine conflict: both sides changed, to different values,
             // since the last sync. Monday.com wins.
-            $this->apply_to_moodle($user->id, $mapping, $mondayvalue);
+            $this->apply_to_moodle_and_maybe_email($DB, $board, $itemid, $user->id, $mapping, $mondayvalue);
             $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], $moodlevalue, $mondayvalue, 'conflict',
                 'Both Monday.com and Moodle changed this field since the last sync - Monday.com\'s value was kept.');
             $this->set_cached_value($DB, $itemid, $columnid, $mondayvalue);
@@ -653,7 +672,7 @@ class sync_manager {
         }
 
         if ($mondaychanged) {
-            $this->apply_to_moodle($user->id, $mapping, $mondayvalue);
+            $this->apply_to_moodle_and_maybe_email($DB, $board, $itemid, $user->id, $mapping, $mondayvalue);
             $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], $cached, $mondayvalue, 'updated', null);
             $this->set_cached_value($DB, $itemid, $columnid, $mondayvalue);
             return;
@@ -734,6 +753,67 @@ class sync_manager {
      */
     protected function moodle_date_to_canonical(int $timestamp): string {
         return $timestamp > 0 ? date('Y-m-d', $timestamp) : '';
+    }
+
+    /**
+     * Apply a field update to Moodle, and - specifically for the
+     * Advanced "auth" field transitioning to "manual" - trigger the
+     * once-only welcome email if this board's configured to send one.
+     * Centralised here so every place that can write auth (toMoodle,
+     * both's baseline-adoption, both's conflict/catch-up cases) gets the
+     * same behaviour without repeating the check at each call site.
+     */
+    protected function apply_to_moodle_and_maybe_email(\moodle_database $DB, \stdClass $board, string $itemid, int $userid, array $mapping, string $newvalue): void {
+        $this->apply_to_moodle($userid, $mapping, $newvalue);
+
+        if ($mapping['type'] === 'advanced' && $mapping['field'] === 'auth'
+            && $newvalue === 'manual' && !empty($board->createemailpassword)) {
+            $this->send_manual_password_email_once($DB, $board, $itemid, $userid);
+        }
+    }
+
+    /**
+     * Send the "here's your new password" welcome email for a manual-auth
+     * account - but only ever once per account, regardless of how many
+     * times its auth method flips away from and back to "manual" (e.g.
+     * created as nologin, later switched to manual once Ops are ready).
+     * Tracked in a dedicated table rather than the sync log, since the
+     * log is subject to the retention-period purge and this needs to be
+     * permanent for as long as the account exists.
+     */
+    protected function send_manual_password_email_once(\moodle_database $DB, \stdClass $board, string $itemid, int $userid): void {
+        if ($DB->record_exists('local_mondaysync_manual_email', ['userid' => $userid])) {
+            return;
+        }
+
+        global $CFG;
+        require_once($CFG->dirroot . '/user/lib.php');
+
+        try {
+            $user = $DB->get_record('user', ['id' => $userid], '*', MUST_EXIST);
+            $sent = setnew_password_and_mail($user);
+        } catch (\Throwable $e) {
+            $this->log($DB, $board->id, $itemid, $userid, 'auth', null, null, 'error',
+                'Could not send the manual-auth welcome email: ' . $e->getMessage());
+            return;
+        }
+
+        if ($sent) {
+            $record = new \stdClass();
+            $record->userid = $userid;
+            $record->timesent = time();
+            $DB->insert_record('local_mondaysync_manual_email', $record);
+            $this->log($DB, $board->id, $itemid, $userid, 'auth', null, null, 'emailed',
+                'Sent the new-password welcome email for this manual-auth account.');
+        } else {
+            // setnew_password_and_mail() returns false rather than
+            // throwing when the mail server rejects it - don't mark this
+            // as sent, but also don't loop retrying it every poll; it'll
+            // only be attempted again on a genuine future transition back
+            // into "manual".
+            $this->log($DB, $board->id, $itemid, $userid, 'auth', null, null, 'error',
+                'Attempted to send the manual-auth welcome email, but it failed (check the server\'s mail logs) - will not retry automatically unless auth changes away from and back to manual.');
+        }
     }
 
     /**

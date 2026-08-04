@@ -109,6 +109,32 @@ offers (a safe standard-field whitelist plus your actual custom fields).
   wording though, so each board has its own "label when suspended" /
   "label when not suspended" text fields (defaulting to "Suspended" /
   "Not Suspended") in the mapping wizard.
+- **Manual-auth welcome email now fires on any transition into "manual",
+  not just at creation.** If an account's created with a different
+  default (e.g. `nologin`, for a staged "waiting state" workflow) and its
+  auth is later switched to `manual` via the Advanced `auth` mapping,
+  that now triggers the same welcome email as a creation-time `manual`
+  default would - but only ever once per account, tracked permanently
+  (not subject to the log retention purge), no matter how many times auth
+  flips away from and back to `manual` afterward.
+- **Deleted-account detection (creation-enabled boards only):** if a row's
+  status reads "User created" but no matching Moodle account can be
+  found, that's treated as a failure rather than silent inaction - the
+  account was almost certainly deleted directly in Moodle (this plugin
+  never deletes accounts itself). The status flips to "Error" and an
+  update is posted on the item explaining what happened, using the same
+  mechanism as an ordinary creation failure - including the same
+  anti-repeat property (it won't re-flag on every subsequent poll, only
+  once, until someone resets the status).
+- **Creation failures post an update on the item.** As well as flipping
+  the trigger column to "Error" and logging it in Moodle, a failed
+  creation attempt now posts a note in that item's Monday.com
+  activity/conversation feed explaining why - visible directly on the
+  board without needing Moodle access, and Monday's own notifications
+  pick it up automatically for anyone subscribed to that item. This is
+  specifically for creation failures (which never repeat until someone
+  manually retries) rather than every kind of sync error, to avoid an
+  unfixed ongoing field-sync issue posting a duplicate update every poll.
 - **User creation (optional, per board):** a Status column on the board
   can trigger creating a new Moodle account for a row with no existing
   match - set it to "Create user", the account's created on the next

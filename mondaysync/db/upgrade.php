@@ -114,5 +114,20 @@ function xmldb_local_mondaysync_upgrade($oldversion) {
         upgrade_plugin_savepoint(true, 2026072500, 'local', 'mondaysync');
     }
 
+    if ($oldversion < 2026072506) {
+        $table = new xmldb_table('local_mondaysync_manual_email');
+        $table->add_field('id', XMLDB_TYPE_INTEGER, '10', null, XMLDB_NOTNULL, XMLDB_SEQUENCE, null);
+        $table->add_field('userid', XMLDB_TYPE_INTEGER, '10', null, XMLDB_NOTNULL, null, null);
+        $table->add_field('timesent', XMLDB_TYPE_INTEGER, '10', null, XMLDB_NOTNULL, null, null);
+        $table->add_key('primary', XMLDB_KEY_PRIMARY, ['id']);
+        $table->add_key('userid', XMLDB_KEY_FOREIGN_UNIQUE, ['userid'], 'user', ['id']);
+
+        if (!$dbman->table_exists($table)) {
+            $dbman->create_table($table);
+        }
+
+        upgrade_plugin_savepoint(true, 2026072506, 'local', 'mondaysync');
+    }
+
     return true;
 }

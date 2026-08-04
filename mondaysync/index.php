@@ -37,7 +37,7 @@ if (empty($logs)) {
     foreach ($logs as $log) {
         $username = $log->userid ? fullname($log) . ' (#' . $log->userid . ')' : '-';
         $status = $log->status;
-        if ($status === 'updated' || $status === 'created') {
+        if ($status === 'updated' || $status === 'created' || $status === 'emailed') {
             $status = html_writer::span($status, 'badge badge-success');
         } else if ($status === 'conflict' || $status === 'warning') {
             $status = html_writer::span($status, 'badge badge-warning');

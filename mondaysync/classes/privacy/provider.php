@@ -16,15 +16,21 @@ use core_privacy\local\request\writer;
  *
  * Personal data touched by this plugin:
  * - local_mondaysync_log: an audit trail of profile field changes applied
- *   to a user (old/new values), tied to userid. This is the only table
- *   that stores personal data against a specific Moodle user.
+ *   to a user (old/new values), and of any new account this plugin has
+ *   created, tied to userid.
+ * - local_mondaysync_manual_email: a permanent record of whether a
+ *   manual-auth account has been sent its "here's your new password"
+ *   welcome email, tied to userid - kept indefinitely (unlike the log,
+ *   which is subject to a retention purge) so the email is never sent
+ *   twice.
  * - local_mondaysync_cache: last-seen Monday.com column values, keyed by
  *   Monday item/column rather than Moodle userid. Not covered here as
  *   user-exportable/deletable data - it holds no direct link to a Moodle
  *   account and self-corrects on the next sync regardless.
  * - Monday.com itself: this plugin sends each user's ID Number to
- *   Monday.com as part of matching board rows to Moodle accounts. That's
- *   data leaving the site entirely, declared below as an external location.
+ *   Monday.com as part of matching board rows to Moodle accounts, and (for
+ *   boards configured to create accounts) reads personal data the other
+ *   way to create them. Declared below as an external location.
  */
 class provider implements
     \core_privacy\local\metadata\provider,
@@ -42,6 +48,15 @@ class provider implements
                 'timecreated' => 'privacy:metadata:local_mondaysync_log:timecreated',
             ],
             'privacy:metadata:local_mondaysync_log'
+        );
+
+        $collection->add_database_table(
+            'local_mondaysync_manual_email',
+            [
+                'userid' => 'privacy:metadata:local_mondaysync_manual_email:userid',
+                'timesent' => 'privacy:metadata:local_mondaysync_manual_email:timesent',
+            ],
+            'privacy:metadata:local_mondaysync_manual_email'
         );
 
         $collection->add_external_location_link(
@@ -62,7 +77,8 @@ class provider implements
 
         $contextlist = new contextlist();
 
-        if ($DB->record_exists('local_mondaysync_log', ['userid' => $userid])) {
+        if ($DB->record_exists('local_mondaysync_log', ['userid' => $userid])
+            || $DB->record_exists('local_mondaysync_manual_email', ['userid' => $userid])) {
             $contextlist->add_system_context();
         }
 
@@ -77,8 +93,8 @@ class provider implements
             return;
         }
 
-        $sql = "SELECT DISTINCT userid FROM {local_mondaysync_log} WHERE userid IS NOT NULL";
-        $userlist->add_from_sql('userid', $sql, []);
+        $userlist->add_from_sql('userid', "SELECT DISTINCT userid FROM {local_mondaysync_log} WHERE userid IS NOT NULL", []);
+        $userlist->add_from_sql('userid', "SELECT DISTINCT userid FROM {local_mondaysync_manual_email}", []);
     }
 
     public static function export_user_data(approved_contextlist $contextlist): void {
@@ -97,27 +113,36 @@ class provider implements
                      WHERE l.userid = :userid
                   ORDER BY l.timecreated ASC";
             $records = $DB->get_records_sql($sql, ['userid' => $user->id]);
-            if (empty($records)) {
-                continue;
+
+            if (!empty($records)) {
+                $data = [];
+                foreach ($records as $record) {
+                    $data[] = (object) [
+                        'board' => $record->boardname ?? get_string('privacy:unknownboard', 'local_mondaysync'),
+                        'monday_item_id' => $record->monday_itemid,
+                        'field' => $record->field,
+                        'oldvalue' => $record->oldvalue,
+                        'newvalue' => $record->newvalue,
+                        'status' => $record->status,
+                        'timecreated' => transform::datetime($record->timecreated),
+                    ];
+                }
+
+                writer::with_context($context)->export_data(
+                    [get_string('pluginname', 'local_mondaysync')],
+                    (object) ['synclog' => $data]
+                );
             }
 
-            $data = [];
-            foreach ($records as $record) {
-                $data[] = (object) [
-                    'board' => $record->boardname ?? get_string('privacy:unknownboard', 'local_mondaysync'),
-                    'monday_item_id' => $record->monday_itemid,
-                    'field' => $record->field,
-                    'oldvalue' => $record->oldvalue,
-                    'newvalue' => $record->newvalue,
-                    'status' => $record->status,
-                    'timecreated' => transform::datetime($record->timecreated),
-                ];
+            $emailrecord = $DB->get_record('local_mondaysync_manual_email', ['userid' => $user->id]);
+            if ($emailrecord) {
+                writer::with_context($context)->export_data(
+                    [get_string('pluginname', 'local_mondaysync')],
+                    (object) ['manualauthemailsent' => (object) [
+                        'timesent' => transform::datetime($emailrecord->timesent),
+                    ]]
+                );
             }
-
-            writer::with_context($context)->export_data(
-                [get_string('pluginname', 'local_mondaysync')],
-                (object) ['synclog' => $data]
-            );
         }
     }
 
@@ -129,6 +154,7 @@ class provider implements
         }
 
         $DB->delete_records('local_mondaysync_log');
+        $DB->delete_records('local_mondaysync_manual_email');
     }
 
     public static function delete_data_for_user(approved_contextlist $contextlist): void {
@@ -141,6 +167,7 @@ class provider implements
                 continue;
             }
             $DB->delete_records('local_mondaysync_log', ['userid' => $user->id]);
+            $DB->delete_records('local_mondaysync_manual_email', ['userid' => $user->id]);
         }
     }
 
@@ -159,5 +186,6 @@ class provider implements
 
         [$insql, $inparams] = $DB->get_in_or_equal($userids, SQL_PARAMS_NAMED);
         $DB->delete_records_select('local_mondaysync_log', "userid $insql", $inparams);
+        $DB->delete_records_select('local_mondaysync_manual_email', "userid $insql", $inparams);
     }
 }

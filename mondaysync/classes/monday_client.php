@@ -227,6 +227,28 @@ class monday_client {
     }
 
     /**
+     * Post an update (a note in the item's activity/conversation feed) to
+     * a Monday.com item. Monday's own notification system picks this up
+     * automatically for anyone subscribed to the item - nothing extra
+     * needed here for that part.
+     *
+     * @param string $itemid
+     * @param string $body Plain text or simple HTML (e.g. <b>) is fine.
+     */
+    public function create_update(string $itemid, string $body): void {
+        $query = 'mutation($itemid: ID!, $body: String!) {
+            create_update(item_id: $itemid, body: $body) {
+                id
+            }
+        }';
+
+        $this->graphql_request($query, [
+            'itemid' => $itemid,
+            'body' => $body,
+        ]);
+    }
+
+    /**
      * Reshape raw items_page items into a simpler [id, columns] structure.
      */
     protected function normalise_items(array $rawitems): array {
