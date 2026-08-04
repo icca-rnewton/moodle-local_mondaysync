@@ -518,6 +518,15 @@ class sync_manager {
             return;
         }
 
+        // Tenant assignment (Moodle Workplace multi-tenancy, if installed)
+        // happens immediately, before anything else - specifically before
+        // the welcome email below, since that email's content/login URL
+        // needs to reflect the correct tenant, not whatever a brand-new
+        // account defaults to.
+        if (class_exists('\tool_tenant\manager')) {
+            $this->assign_tenant($DB, $board, $itemid, $item, $newuserid);
+        }
+
         if ($newuser->auth === 'manual' && !empty($board->createemailpassword)) {
             $this->send_manual_password_email_once($DB, $board, $itemid, $newuserid);
         }
@@ -532,6 +541,70 @@ class sync_manager {
 
         $this->log($DB, $board->id, $itemid, $newuserid, null, null, null, 'created',
             'New Moodle account created (username: ' . $username . ', auth: ' . $newuser->auth . ').');
+    }
+
+    /**
+     * Assign a newly-created account to a Moodle Workplace tenant, if this
+     * board has tenant handling configured. Resolution order:
+     * 1. The per-row Monday column, if configured and its text matches a
+     *    real tenant name (case-insensitive) - a warning is logged if it's
+     *    set but doesn't match anything, rather than silently ignored.
+     * 2. The board's configured default tenant, used whenever (1) doesn't
+     *    resolve to anything (blank column, no column configured, or an
+     *    unmatched name).
+     * 3. If neither resolves to a tenant, nothing is done - Workplace's
+     *    own default tenant behaviour applies, exactly as if this feature
+     *    didn't exist.
+     *
+     * Uses \tool_tenant\manager::allocate_user() and
+     * \tool_tenant\tenancy::get_tenants() - the documented API for this
+     * (Moodle Workplace's own README explicitly says not to query its
+     * tables directly, since the schema isn't a supported external API).
+     * Critically, allocate_user() also triggers the proper
+     * tenant_user_created event - a raw database write wouldn't, and
+     * whatever tenant-specific behaviour Workplace itself hangs off that
+     * event (e.g. tenant-branded emails) would likely never fire.
+     */
+    protected function assign_tenant(\moodle_database $DB, \stdClass $board, string $itemid, array $item, int $newuserid): void {
+        $tenants = \tool_tenant\tenancy::get_tenants();
+
+        $tenantid = null;
+        $columnid = trim((string)($board->createtenantcolumnid ?? ''));
+
+        if ($columnid !== '' && array_key_exists($columnid, $item['columns'])) {
+            $requestedname = trim($item['columns'][$columnid]['text'] ?? '');
+            if ($requestedname !== '') {
+                foreach ($tenants as $tenant) {
+                    if (strcasecmp(trim($tenant->name), $requestedname) === 0) {
+                        $tenantid = (int)$tenant->id;
+                        break;
+                    }
+                }
+                if ($tenantid === null) {
+                    $this->log($DB, $board->id, $itemid, $newuserid, 'tenant', null, $requestedname, 'warning',
+                        '"' . $requestedname . '" doesn\'t match any Moodle Workplace tenant name - falling back to this board\'s default tenant, if one is configured.');
+                }
+            }
+        }
+
+        if ($tenantid === null) {
+            $defaulttenantid = (int)($board->createdefaulttenantid ?? 0);
+            if ($defaulttenantid > 0 && array_key_exists($defaulttenantid, $tenants)) {
+                $tenantid = $defaulttenantid;
+            }
+        }
+
+        if ($tenantid === null) {
+            return; // Nothing configured or resolvable - leave Workplace's own default behaviour to apply.
+        }
+
+        try {
+            (new \tool_tenant\manager())->allocate_user($newuserid, $tenantid, 'local_mondaysync', 'Assigned via Monday.com board sync');
+            $this->log($DB, $board->id, $itemid, $newuserid, 'tenant', null, $tenants[$tenantid]->name, 'updated', null);
+        } catch (\Throwable $e) {
+            $this->log($DB, $board->id, $itemid, $newuserid, 'tenant', null, null, 'error',
+                'Account was created, but tenant assignment failed: ' . $e->getMessage());
+        }
     }
 
     /**

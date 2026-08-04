@@ -109,6 +109,19 @@ offers (a safe standard-field whitelist plus your actual custom fields).
   wording though, so each board has its own "label when suspended" /
   "label when not suspended" text fields (defaulting to "Suspended" /
   "Not Suspended") in the mapping wizard.
+- **Moodle Workplace multi-tenancy (optional, only shown if that plugin
+  is installed):** new accounts can be assigned to a tenant as part of
+  creation, before anything else - including the welcome email, so its
+  content reflects the correct tenant from the start. A per-row Monday
+  column (matched against tenant names) can override a board-level
+  default tenant; if neither resolves, Workplace's own default tenant
+  behaviour applies unchanged. Implemented using Workplace's own
+  documented API (`\tool_tenant\manager::allocate_user()`), not direct
+  database access - Workplace's own README explicitly warns against that,
+  since the schema isn't a supported external interface, and using the
+  real API also ensures the proper `tenant_user_created` event fires
+  (which anything Workplace itself hangs off tenant assignment, such as
+  tenant-branded behaviour, likely depends on).
 - **Manual-auth welcome email now fires on any transition into "manual",
   not just at creation.** If an account's created with a different
   default (e.g. `nologin`, for a staged "waiting state" workflow) and its

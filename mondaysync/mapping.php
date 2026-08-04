@@ -75,6 +75,8 @@ $customdata = [
     'createusernamecolumnid' => $board->createusernamecolumnid ?? '',
     'createdefaultauth' => $board->createdefaultauth ?? '',
     'createemailpassword' => $board->createemailpassword ?? 0,
+    'createtenantcolumnid' => $board->createtenantcolumnid ?? '',
+    'createdefaulttenantid' => $board->createdefaulttenantid ?? '',
     'enabledauthplugins' => get_enabled_auth_plugins(),
 ];
 
@@ -127,6 +129,13 @@ if ($mform->is_cancelled()) {
     $board->createusernamecolumnid = trim((string)$data->createusernamecolumnid);
     $board->createdefaultauth = trim((string)$data->createdefaultauth);
     $board->createemailpassword = !empty($data->createemailpassword) ? 1 : 0;
+    // These two only exist in $data at all if tool_tenant is installed (the
+    // form doesn't render them otherwise) - preserve whatever was already
+    // saved rather than wiping it out if that's ever not the case.
+    $board->createtenantcolumnid = isset($data->createtenantcolumnid) ? trim((string)$data->createtenantcolumnid) : ($board->createtenantcolumnid ?? null);
+    $board->createdefaulttenantid = (isset($data->createdefaulttenantid) && $data->createdefaulttenantid !== '')
+        ? (int)$data->createdefaulttenantid
+        : ($board->createdefaulttenantid ?? null);
     \local_mondaysync\board_repository::save($board);
 
     redirect($boardslisturl, get_string('mappingsaved', 'local_mondaysync'), null, \core\output\notification::NOTIFY_SUCCESS);

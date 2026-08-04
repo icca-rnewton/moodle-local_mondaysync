@@ -20,6 +20,8 @@
         <FIELD NAME="createusernamecolumnid" TYPE="char" LENGTH="100" NOTNULL="false" SEQUENCE="false"/>
         <FIELD NAME="createdefaultauth" TYPE="char" LENGTH="100" NOTNULL="false" SEQUENCE="false" COMMENT="Auth plugin shortname new accounts are created with"/>
         <FIELD NAME="createemailpassword" TYPE="int" LENGTH="1" NOTNULL="true" DEFAULT="0" SEQUENCE="false" COMMENT="Whether new manual-auth accounts are emailed a generated password"/>
+        <FIELD NAME="createtenantcolumnid" TYPE="char" LENGTH="100" NOTNULL="false" SEQUENCE="false" COMMENT="Optional Monday.com column holding a Moodle Workplace tenant name, per row"/>
+        <FIELD NAME="createdefaulttenantid" TYPE="int" LENGTH="10" NOTNULL="false" SEQUENCE="false" COMMENT="Moodle Workplace tool_tenant.id used when the per-row tenant column is blank or unmatched"/>
         <FIELD NAME="timecreated" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false"/>
         <FIELD NAME="timemodified" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false"/>
       </FIELDS>

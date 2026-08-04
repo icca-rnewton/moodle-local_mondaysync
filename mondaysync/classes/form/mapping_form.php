@@ -32,6 +32,9 @@ class mapping_form extends \moodleform {
     /** @var string[] Enabled auth plugin shortnames on this site. */
     protected $validauthplugins = [];
 
+    /** @var string[] Valid Moodle Workplace tenant IDs (as strings), if tool_tenant is installed. */
+    protected $validtenantids = [];
+
     public function definition() {
         $mform = $this->_form;
         $columns = $this->_customdata['columns'];
@@ -219,6 +222,38 @@ class mapping_form extends \moodleform {
         $mform->setDefault('createemailpassword', !empty($this->_customdata['createemailpassword']) ? 1 : 0);
         $mform->addElement('static', 'createemailpassword_desc', '', get_string('createemailpassword_desc', 'local_mondaysync'));
 
+        // Moodle Workplace multi-tenancy - only shown at all if that plugin
+        // is actually installed on this site, so it stays fully invisible
+        // (and harmless) on plain Moodle, or after a future move away from
+        // Workplace.
+        if (class_exists('\tool_tenant\manager')) {
+            $mform->addElement('static', 'tenancyintro', get_string('tenancyheader', 'local_mondaysync'),
+                get_string('tenancyintro', 'local_mondaysync'));
+
+            $tenantcolumnoptions = ['' => get_string('donotsync', 'local_mondaysync')];
+            foreach ($columns as $col) {
+                $tenantcolumnoptions[$col['id']] = $col['title'] . ' (' . $col['id'] . ', ' . $col['type'] . ')';
+            }
+            $mform->addElement('select', 'createtenantcolumnid', get_string('createtenantcolumn', 'local_mondaysync'), $tenantcolumnoptions);
+            $mform->setType('createtenantcolumnid', PARAM_RAW);
+            $mform->setDefault('createtenantcolumnid', $this->_customdata['createtenantcolumnid'] ?? '');
+            $mform->addElement('static', 'createtenantcolumn_desc', '', get_string('createtenantcolumn_desc', 'local_mondaysync'));
+
+            $tenantoptions = ['' => get_string('notenantdefault', 'local_mondaysync')];
+            foreach (\tool_tenant\tenancy::get_tenants() as $tenant) {
+                $label = $tenant->name;
+                if (!empty($tenant->idnumber)) {
+                    $label .= ' (' . $tenant->idnumber . ')';
+                }
+                $tenantoptions[$tenant->id] = $label;
+                $this->validtenantids[] = (string)$tenant->id;
+            }
+            $mform->addElement('select', 'createdefaulttenantid', get_string('createdefaulttenant', 'local_mondaysync'), $tenantoptions);
+            $mform->setType('createdefaulttenantid', PARAM_RAW);
+            $mform->setDefault('createdefaulttenantid', $this->_customdata['createdefaulttenantid'] ?? '');
+            $mform->addElement('static', 'createdefaulttenant_desc', '', get_string('createdefaulttenant_desc', 'local_mondaysync'));
+        }
+
         $this->add_action_buttons(true, get_string('savemapping', 'local_mondaysync'));
     }
 
@@ -302,6 +337,16 @@ class mapping_form extends \moodleform {
         } else if (!empty($data['createdefaultauth']) && !in_array($data['createdefaultauth'], $this->validauthplugins, true)) {
             // Still validate even when creation is off, in case it's re-enabled later with stale data.
             $errors['createdefaultauth'] = get_string('invalidselection', 'local_mondaysync');
+        }
+
+        // Tenant fields are both optional - only validate that a submitted
+        // value (if any) is actually one of the options offered.
+        if (!empty($data['createtenantcolumnid']) && !in_array($data['createtenantcolumnid'], $this->validcolumnids, true)) {
+            $errors['createtenantcolumnid'] = get_string('invalidselection', 'local_mondaysync');
+        }
+        if (isset($data['createdefaulttenantid']) && $data['createdefaulttenantid'] !== ''
+            && !in_array((string)$data['createdefaulttenantid'], $this->validtenantids, true)) {
+            $errors['createdefaulttenantid'] = get_string('invalidselection', 'local_mondaysync');
         }
 
         return $errors;

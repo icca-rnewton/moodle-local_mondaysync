@@ -139,6 +139,15 @@ $string['createdefaultauth_desc'] = 'Only auth methods currently enabled on this
 $string['createemailpassword'] = 'Email new manual-auth accounts their password';
 $string['createemailpassword_desc'] = 'Moodle generates a password and emails it to the account directly (the same mechanism used by Moodle\'s own bulk user upload tool) - not relevant for SSO-based methods like SAML2, which don\'t use a Moodle-stored password at all. This applies whenever an account\'s authentication method becomes "Manual accounts" - at creation if that\'s the default above, or later if you also map a column to the Advanced "auth" field and it changes to manual (e.g. a staged "created as nologin, switched to manual once ready" workflow). Sent once per account, however many times it moves away from and back to manual afterward.';
 
+// Moodle Workplace multi-tenancy (only shown if that plugin is installed).
+$string['tenancyheader'] = 'Tenant (Moodle Workplace)';
+$string['tenancyintro'] = 'This site has Moodle Workplace\'s multi-tenancy feature installed. Optionally, assign new accounts to a specific tenant as part of creation - before anything else happens, including the welcome email above, so its content reflects the correct tenant from the start.';
+$string['createtenantcolumn'] = 'Tenant name column (optional)';
+$string['createtenantcolumn_desc'] = 'A Monday.com column whose text should exactly match one of this site\'s tenant names (case doesn\'t matter). Leave as "Do not sync" to always use the default tenant below instead.';
+$string['notenantdefault'] = '— No default (use Workplace\'s own default tenant) —';
+$string['createdefaulttenant'] = 'Default tenant';
+$string['createdefaulttenant_desc'] = 'Used whenever the tenant column above is blank, not configured, or doesn\'t match a real tenant name. Since boards here typically correspond to one tenant each, this is usually the main mechanism - the per-row column above is more for the occasional exception.';
+
 // Errors.
 $string['errormondayhttp'] = 'Monday.com API returned an unexpected HTTP status: {$a}';
 $string['errormondayresponse'] = 'Could not decode Monday.com API response: {$a}';

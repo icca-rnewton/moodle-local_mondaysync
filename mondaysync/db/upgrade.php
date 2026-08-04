@@ -129,5 +129,22 @@ function xmldb_local_mondaysync_upgrade($oldversion) {
         upgrade_plugin_savepoint(true, 2026072506, 'local', 'mondaysync');
     }
 
+    if ($oldversion < 2026072509) {
+        $table = new xmldb_table('local_mondaysync_board');
+
+        $newfields = [
+            new xmldb_field('createtenantcolumnid', XMLDB_TYPE_CHAR, '100', null, null, null, null),
+            new xmldb_field('createdefaulttenantid', XMLDB_TYPE_INTEGER, '10', null, null, null, null),
+        ];
+
+        foreach ($newfields as $field) {
+            if (!$dbman->field_exists($table, $field)) {
+                $dbman->add_field($table, $field);
+            }
+        }
+
+        upgrade_plugin_savepoint(true, 2026072509, 'local', 'mondaysync');
+    }
+
     return true;
 }
