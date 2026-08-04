@@ -137,7 +137,7 @@ $string['chooseauth'] = 'Choose an authentication method…';
 $string['createdefaultauth'] = 'Default authentication method for new accounts';
 $string['createdefaultauth_desc'] = 'Only auth methods currently enabled on this site are listed. This is just the starting value for a brand-new account - if you also map a column to the Advanced "auth" field, later changes on Monday will update it normally from that point on, the same as for any other account.';
 $string['createemailpassword'] = 'Email new manual-auth accounts their password';
-$string['createemailpassword_desc'] = 'Only applies when the default authentication method above is "Manual accounts". Moodle generates a password and emails it to the new account directly (the same mechanism used by Moodle\'s own bulk user upload tool) - not relevant for SSO-based methods like SAML2, which don\'t use a Moodle-stored password at all.';
+$string['createemailpassword_desc'] = 'Moodle generates a password and emails it to the account directly (the same mechanism used by Moodle\'s own bulk user upload tool) - not relevant for SSO-based methods like SAML2, which don\'t use a Moodle-stored password at all. This applies whenever an account\'s authentication method becomes "Manual accounts" - at creation if that\'s the default above, or later if you also map a column to the Advanced "auth" field and it changes to manual (e.g. a staged "created as nologin, switched to manual once ready" workflow). Sent once per account, however many times it moves away from and back to manual afterward.';
 
 // Errors.
 $string['errormondayhttp'] = 'Monday.com API returned an unexpected HTTP status: {$a}';
