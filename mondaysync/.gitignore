@@ -1,0 +1,4 @@
+# Runtime/hosting artifacts that should never ship with the plugin.
+error_log
+*.log
+.DS_Store

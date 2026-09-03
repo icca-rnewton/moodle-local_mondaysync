@@ -1,4 +1,27 @@
 <?php
+// This file is part of Moodle - http://moodle.org/
+//
+// Moodle is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Moodle is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with Moodle.  If not, see <http://www.gnu.org/licenses/>.
+
+/**
+ * Orchestrates a sync run across every connected Monday.com board.
+ *
+ * @package    local_mondaysync
+ * @copyright  2026 Inns of Court College of Advocacy (Part of COIC)
+ * @license    http://www.gnu.org/licenses/GPL-3.0 GNU GPL v3 or later
+ */
+
 namespace local_mondaysync;
 
 defined('MOODLE_INTERNAL') || die();
@@ -113,6 +136,8 @@ class sync_manager {
             $livecolumns = $client->get_board_columns($board->boardid);
         } catch (\Throwable $e) {
             mtrace('local_mondaysync: board "' . $board->name . '" - failed to fetch columns: ' . $e->getMessage());
+            $this->log($DB, $board->id, '(board)', null, null, null, null, 'error',
+                'Could not fetch columns from Monday.com this run - board was skipped entirely: ' . $e->getMessage());
             return;
         }
         $livecolumnids = array_column($livecolumns, 'id');
@@ -168,6 +193,8 @@ class sync_manager {
             $items = $client->get_all_board_items($board->boardid);
         } catch (\Throwable $e) {
             mtrace('local_mondaysync: board "' . $board->name . '" - failed to fetch items: ' . $e->getMessage());
+            $this->log($DB, $board->id, '(board)', null, null, null, null, 'error',
+                'Could not fetch items from Monday.com this run - board was skipped entirely: ' . $e->getMessage());
             return;
         }
 
@@ -663,12 +690,43 @@ class sync_manager {
             // silently misinterpret, so an unrecognised value is an error,
             // not a guess.
             $normalised = mapping_util::parse_suspended_value($mondayvalue);
-            if ($mondayvalue !== '' && $normalised === null) {
-                $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], null, $mondayvalue, 'error',
-                    'Could not interpret "' . $mondayvalue . '" as suspended/not-suspended - expected something like Yes/No, 1/0, True/False, or Suspended/Not Suspended.');
+
+            if ($normalised === null && in_array($direction, ['toMoodle', 'both'], true)) {
+                // Only relevant when this value could actually be written
+                // INTO Moodle (toMoodle/both) - never guess, skip this
+                // field for this row rather than risk it. A toMonday-only
+                // mapping never writes $mondayvalue anywhere, so a blank/
+                // unrecognised Monday cell doesn't need blocking here -
+                // see below, it naturally still triggers the correcting
+                // push instead.
+                //
+                // 2026 fix (Titus review, Critical #2): a blank cell used
+                // to fall through this check entirely (the old guard only
+                // fired for non-blank unrecognised text) and become an
+                // empty string, which coerces to 0 on Moodle's integer
+                // 'suspended' column - silently un-suspending the account,
+                // and repeating every single run since '' never matched
+                // the stored '0'. Blank now takes the same "never guess,
+                // skip" path as genuinely unrecognised text - the only
+                // difference is a blank cell doesn't log a loud error,
+                // since it's a normal/expected state (e.g. a freshly
+                // added row nobody's set a status on yet), whereas
+                // unrecognised text is a real problem worth flagging.
+                if ($mondayvalue !== '') {
+                    $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], null, $mondayvalue, 'error',
+                        'Could not interpret "' . $mondayvalue . '" as suspended/not-suspended - expected something like Yes/No, 1/0, True/False, or Suspended/Not Suspended.');
+                }
                 return;
             }
-            $mondayvalue = $normalised ?? '';
+
+            if ($normalised !== null) {
+                $mondayvalue = $normalised;
+            }
+            // else (toMonday-only, blank/unrecognised): leave $mondayvalue
+            // as the raw text. It'll naturally differ from $moodlevalue
+            // ('0'/'1'), so the toMonday comparison below still correctly
+            // treats Monday's display as needing correction, rather than
+            // being blocked from ever fixing an out-of-date Monday cell.
         }
 
         if ($mapping['type'] === 'advanced' && $mapping['field'] === 'auth'
@@ -910,8 +968,15 @@ class sync_manager {
             // stops an advanced-field mapping from ever being able to
             // touch the password column, regardless of field name -
             // Moodle ignores ->password entirely when this is false. Don't
-            // change this to true without re-checking that implication.
-            user_update_user($user, false, false);
+            // change this to false without re-checking that implication.
+            //
+            // triggerevent=true (2026 fix, Titus review #7): the two
+            // parameters are independent - only updatepassword ever needed
+            // to be false. Suppressing the event too meant other Moodle/
+            // Workplace functionality listening for user_updated (Dynamic
+            // Rules, audience/programme behaviour, other observers) never
+            // learned the account had changed.
+            user_update_user($user, false, true);
         } else if ($mapping['type'] === 'date') {
             require_once($CFG->dirroot . '/user/profile/lib.php');
             $data = new \stdClass();
