@@ -169,5 +169,48 @@ function xmldb_local_mondaysync_upgrade($oldversion) {
         upgrade_plugin_savepoint(true, 2026072509, 'local', 'mondaysync');
     }
 
+    if ($oldversion < 2026072700) {
+        $table = new xmldb_table('local_mondaysync_cache');
+        $field = new xmldb_field('userid', XMLDB_TYPE_INTEGER, '10', null, null, null, null, 'value');
+
+        if (!$dbman->field_exists($table, $field)) {
+            $dbman->add_field($table, $field);
+        }
+
+        $index = new xmldb_index('userid', XMLDB_INDEX_NOTUNIQUE, ['userid']);
+        if (!$dbman->index_exists($table, $index)) {
+            $dbman->add_index($table, $index);
+        }
+
+        // Best-effort backfill (Titus review #17): for existing cache rows
+        // with no userid yet, try to trace one via the log table's
+        // history for the same monday_itemid, while that history still
+        // exists (it's subject to its own retention purge - this window
+        // narrows over time, which is exactly why userid is now stored
+        // directly going forward rather than relying on this tracing at
+        // all). Rows with no matching log entry, or no userid recorded on
+        // that entry, are simply left as before (userid null) - they'll
+        // pick one up naturally next time that item/column is synced.
+        // Done as a small per-row PHP loop rather than a single SQL
+        // statement, since a portable "most recent matching log row"
+        // subquery isn't straightforward across different DB engines,
+        // and this is realistically a small table.
+        $rows = $DB->get_records_select('local_mondaysync_cache', 'userid IS NULL', [], '', 'id, monday_itemid');
+        foreach ($rows as $row) {
+            $loguserid = $DB->get_field_sql(
+                "SELECT userid FROM {local_mondaysync_log}
+                  WHERE monday_itemid = :itemid AND userid IS NOT NULL
+               ORDER BY timecreated DESC",
+                ['itemid' => $row->monday_itemid],
+                IGNORE_MULTIPLE
+            );
+            if ($loguserid) {
+                $DB->set_field('local_mondaysync_cache', 'userid', $loguserid, ['id' => $row->id]);
+            }
+        }
+
+        upgrade_plugin_savepoint(true, 2026072700, 'local', 'mondaysync');
+    }
+
     return true;
 }

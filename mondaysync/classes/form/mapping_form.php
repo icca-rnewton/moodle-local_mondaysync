@@ -72,7 +72,7 @@ class mapping_form extends \moodleform {
 
         $columnoptions = ['' => get_string('choosecolumn', 'local_mondaysync')];
         foreach ($columns as $col) {
-            $columnoptions[$col['id']] = $col['title'] . ' (' . $col['id'] . ', ' . $col['type'] . ')';
+            $columnoptions[$col['id']] = $this->column_label($col);
             $this->validcolumnids[] = $col['id'];
             if ($col['type'] === 'status') {
                 $this->validstatuscolumnids[] = $col['id'];
@@ -122,6 +122,11 @@ class mapping_form extends \moodleform {
 
         $mform->addElement('static', 'advancedwarning', '', $this->warning(get_string('advancedwarning', 'local_mondaysync')));
 
+        $mform->addElement('static', 'columnfilter', '', $this->column_picker_html($columns, $rawmappings));
+
+        global $PAGE;
+        $PAGE->requires->js_amd_inline($this->column_picker_js($columns, $rawmappings));
+
         // Shared by every column's direction dropdown.
         $directionoptions = [
             'toMoodle' => get_string('directiontomoodle', 'local_mondaysync'),
@@ -132,7 +137,7 @@ class mapping_form extends \moodleform {
         foreach ($columns as $col) {
             $targetelname = 'target_' . $col['id'];
             $directionelname = 'direction_' . $col['id'];
-            $label = $col['title'] . ' (' . $col['id'] . ', ' . $col['type'] . ')';
+            $label = $this->column_label($col);
 
             // Start from the shared options, but this column may need one
             // extra "orphaned" option added just for it, if its saved
@@ -149,14 +154,31 @@ class mapping_form extends \moodleform {
                 }
             }
 
+            $removehtml = '<button type="button" class="btn btn-link btn-sm p-0 ml-2 local-mondaysync-remove-btn"'
+                . ' data-colid="' . s($col['id']) . '">' . s(get_string('removemapping', 'local_mondaysync')) . '</button>';
+
             $group = [
                 $mform->createElement('select', $targetelname, '', $columnoptionsforselect),
                 $mform->createElement('select', $directionelname, '', $directionoptions),
+                $mform->createElement('advcheckbox', $allowclearelname, '', get_string('allowclear', 'local_mondaysync')),
+                $mform->createElement('static', 'remove_' . $col['id'], '', $removehtml),
             ];
             $mform->addGroup($group, 'group_' . $col['id'], $label, ' ', false);
             $mform->setType($targetelname, PARAM_RAW);
             $mform->setType($directionelname, PARAM_RAW);
+            $mform->setType($allowclearelname, PARAM_BOOL);
             $mform->setDefault($directionelname, \local_mondaysync\mapping_util::DEFAULT_DIRECTION);
+            $mform->setDefault($allowclearelname, 0);
+
+            // Standalone (not a group member) - a plain, simple signal the
+            // Remove button sets directly and the save logic checks
+            // first, deliberately independent of whatever the grouped
+            // <select>'s own submitted value turns out to be. Always
+            // starts at 0 on a fresh page load; this is a "did the admin
+            // click Remove during this visit" flag, not something ever
+            // read back from the saved config.
+            $mform->addElement('hidden', 'removed_' . $col['id'], 0);
+            $mform->setType('removed_' . $col['id'], PARAM_BOOL);
 
             if ($saved !== null) {
                 $current = $saved['type'] . ':' . $saved['field'];
@@ -211,7 +233,7 @@ class mapping_form extends \moodleform {
         $statuscolumnoptions = ['' => get_string('choosecolumn', 'local_mondaysync')];
         foreach ($columns as $col) {
             if ($col['type'] === 'status') {
-                $statuscolumnoptions[$col['id']] = $col['title'] . ' (' . $col['id'] . ')';
+                $statuscolumnoptions[$col['id']] = $this->column_label($col, false);
             }
         }
         $mform->addElement('select', 'createtriggercolumnid', get_string('createtriggercolumn', 'local_mondaysync'), $statuscolumnoptions);
@@ -255,7 +277,7 @@ class mapping_form extends \moodleform {
 
             $tenantcolumnoptions = ['' => get_string('donotsync', 'local_mondaysync')];
             foreach ($columns as $col) {
-                $tenantcolumnoptions[$col['id']] = $col['title'] . ' (' . $col['id'] . ', ' . $col['type'] . ')';
+                $tenantcolumnoptions[$col['id']] = $this->column_label($col);
             }
             $mform->addElement('select', 'createtenantcolumnid', get_string('createtenantcolumn', 'local_mondaysync'), $tenantcolumnoptions);
             $mform->setType('createtenantcolumnid', PARAM_RAW);
@@ -268,7 +290,7 @@ class mapping_form extends \moodleform {
                 if (!empty($tenant->idnumber)) {
                     $label .= ' (' . $tenant->idnumber . ')';
                 }
-                $tenantoptions[$tenant->id] = $label;
+                $tenantoptions[$tenant->id] = s($label);
                 $this->validtenantids[] = (string)$tenant->id;
             }
             $mform->addElement('select', 'createdefaulttenantid', get_string('createdefaulttenant', 'local_mondaysync'), $tenantoptions);
@@ -333,6 +355,31 @@ class mapping_form extends \moodleform {
             }
         }
 
+        // 2026 fix (external review, item 3): nothing prevented two
+        // different Monday columns being mapped to the same Moodle field.
+        // Since each column tracks its own independent sync-cache
+        // baseline, that would make the two mappings fight each other on
+        // every poll - each one only knows about its own last-seen value,
+        // not that the other changed the same field moments earlier - and
+        // there's no algorithmically "correct" outcome to compute when
+        // two Monday columns disagree about one Moodle field. Reject the
+        // configuration outright rather than attempt conflict-resolution
+        // for something that's fundamentally ambiguous.
+        $targetcolumns = [];
+        foreach ($this->_customdata['columns'] as $col) {
+            $submitted = $data['target_' . $col['id']] ?? '';
+            if ($submitted !== '') {
+                $targetcolumns[$submitted][] = $col['id'];
+            }
+        }
+        foreach ($targetcolumns as $colids) {
+            if (count($colids) > 1) {
+                foreach ($colids as $dupcolid) {
+                    $errors['group_' . $dupcolid] = get_string('duplicatetarget', 'local_mondaysync');
+                }
+            }
+        }
+
         // User creation: if enabled, the trigger column and all four
         // required field mappings, plus a default auth, must be set - and
         // each must be one of the options actually offered, not a
@@ -342,6 +389,14 @@ class mapping_form extends \moodleform {
                 $errors['createtriggercolumnid'] = get_string('required');
             } else if (!in_array($data['createtriggercolumnid'], $this->validstatuscolumnids, true)) {
                 $errors['createtriggercolumnid'] = get_string('invalidselection', 'local_mondaysync');
+            } else if (!empty($data['target_' . $data['createtriggercolumnid']])) {
+                // 2026 fix (external review, item 3): nothing stopped the
+                // trigger column also being picked in the ordinary
+                // per-column mapping dropdown - the regular sync engine
+                // would then process it as a normal mapping on every
+                // poll, fighting with (and overwriting) the trigger-
+                // specific status logic that column is meant to drive.
+                $errors['createtriggercolumnid'] = get_string('triggercolumnalsomapped', 'local_mondaysync');
             }
 
             foreach (['createfirstnamecolumnid', 'createlastnamecolumnid', 'createemailcolumnid', 'createusernamecolumnid'] as $elname) {
@@ -433,5 +488,274 @@ class mapping_form extends \moodleform {
 
     protected function warning(string $text): string {
         return \html_writer::span('⚠ ' . $text, 'text-danger');
+    }
+
+    /**
+     * Build a display label for a Monday.com column - "Title (id, type)" or
+     * "Title (id)" - with everything escaped.
+     *
+     * 2026 fix (external review, Critical #1): Monday column titles are
+     * externally-supplied data (anyone able to rename a board column
+     * controls this text) and were being interpolated into select option
+     * text and group labels completely unescaped across four separate
+     * locations in this file. Moodle's HTML_QuickForm_select renders
+     * option text with zero escaping of its own (confirmed directly
+     * against core source) - a column renamed to something like
+     * "</option><script>...</script>" would execute when an admin opened
+     * this page. Centralising every column-label construction through
+     * this one escaped helper, rather than fixing four call sites
+     * individually, so a future fifth usage can't reintroduce the same
+     * gap by simply forgetting to escape it again.
+     */
+    protected function column_label(array $col, bool $includetype = true): string {
+        $label = $col['title'] . ' (' . $col['id'];
+        if ($includetype) {
+            $label .= ', ' . $col['type'];
+        }
+        $label .= ')';
+        return s($label);
+    }
+
+    /**
+     * "Select columns to map" picker: a compact, searchable, scrollable
+     * checklist of every column, with a "Bring over for mapping" button
+     * that reveals the full target/direction/allow-clear controls only
+     * for the columns actually chosen - rather than showing every
+     * column's full controls all at once, which gets overwhelming fast
+     * on a board with many columns.
+     *
+     * Purely client-side (no server round-trip) - every column's controls
+     * already exist in the page exactly as before, this just adds a
+     * layer on top that shows/hides them. Already-mapped columns (from a
+     * previous save) start already "brought over", visible below without
+     * needing to be picked again each time the wizard's opened.
+     *
+     * Finds each column's row by walking up from the target select's own
+     * reliable id (id_target_<columnid>, set explicitly by this form) to
+     * its enclosing <fieldset> - confirmed against the real rendered HTML
+     * that this fieldset wraps all of a row's controls (target, direction,
+     * allow-clear, remove) plus a legend containing the column's title,
+     * so it's both the right thing to show/hide and searchable by name.
+     * Deliberately not relying on any Moodle/YUI-generated wrapper id for
+     * the row itself - those are assigned at runtime and non-deterministic
+     * (confirmed by inspecting the real rendered page), unlike the ids
+     * this form sets explicitly on its own elements.
+     *
+     * The visible column name/title sits in a *separate* label column, a
+     * sibling of the fieldset rather than inside it - confirmed against
+     * the real rendered page - with its own stable, predictable id
+     * (fgroup_id_group_<columnid>_label), so that's toggled alongside the
+     * fieldset rather than assumed to be part of it.
+     */
+    protected function column_picker_html(array $columns, array $rawmappings): string {
+        $pickeritems = '';
+        $initiallymapped = [];
+
+        foreach ($columns as $col) {
+            $colid = $col['id'];
+            $initiallymapped[$colid] = isset($rawmappings[$colid]);
+            $pickeritems .= '<div class="local-mondaysync-picker-item py-1" id="local_mondaysync_picker_item_' . s($colid) . '">'
+                . '<label class="mb-0 font-weight-normal"><input type="checkbox" class="local-mondaysync-picker-checkbox mr-1" value="' . s($colid) . '"> '
+                . s($col['title']) . ' <span class="text-muted small">(' . s($colid) . ', ' . s($col['type']) . ')</span>'
+                . '</label></div>';
+        }
+
+        $searchlabel = get_string('columnfiltersearch', 'local_mondaysync');
+        $bringoverlabel = get_string('bringoverformapping', 'local_mondaysync');
+
+        $html = '<div class="local-mondaysync-picker border rounded p-3 mb-4">'
+            . '<p class="mb-2">' . s(get_string('pickerintro', 'local_mondaysync')) . '</p>'
+            . '<input type="text" id="local_mondaysync_picker_search" class="form-control mb-2"'
+            . ' placeholder="' . s($searchlabel) . '" style="max-width:320px">'
+            . '<div id="local_mondaysync_picker_list" class="border rounded p-2 mb-2 bg-white" style="max-height:220px; overflow-y:auto;">'
+            . $pickeritems
+            . '</div>'
+            . '<button type="button" id="local_mondaysync_bringover" class="btn btn-secondary btn-sm">' . s($bringoverlabel) . '</button>'
+            . ' <span id="local_mondaysync_picker_count" class="text-muted small ml-2"></span>'
+            . '</div>';
+
+        return $html;
+    }
+
+    /**
+     * The picker's behaviour, registered via $PAGE->requires->js_amd_inline()
+     * rather than embedded as an inline <script> tag in form content -
+     * confirmed by inspecting the real rendered page that Moodle's own
+     * client-side JS rebuilds this group's surrounding DOM after the
+     * initial page load, and a <script> tag inserted as part of a DOM
+     * rebuild (rather than present during the browser's original HTML
+     * parse) never executes at all, silently, with no error of any kind.
+     * Using Moodle's actual page-JS mechanism runs independently of
+     * whatever that rebuild does.
+     */
+    protected function column_picker_js(array $columns, array $rawmappings): string {
+        $initiallymapped = [];
+        foreach ($columns as $col) {
+            $initiallymapped[$col['id']] = isset($rawmappings[$col['id']]);
+        }
+
+        // Placeholder token substituted client-side, so word order stays
+        // correct for any future translation rather than being hardcoded
+        // in JS.
+        $counttemplate = get_string('pickercount', 'local_mondaysync', (object)['available' => '__AVAILABLE__']);
+
+        $columnidsjson = json_encode(array_column($columns, 'id'));
+        $initiallymappedjson = json_encode($initiallymapped);
+        $counttemplatejson = json_encode($counttemplate);
+
+        return '
+(function() {
+    var columnIds = ' . $columnidsjson . ';
+    var initiallyMapped = ' . $initiallymappedjson . ';
+    var countTemplate = ' . $counttemplatejson . ';
+
+    var pickerSearch = document.getElementById("local_mondaysync_picker_search");
+    var bringOverBtn = document.getElementById("local_mondaysync_bringover");
+    var pickerCount = document.getElementById("local_mondaysync_picker_count");
+
+    function getRow(colid) {
+        var select = document.getElementById("id_target_" + colid);
+        return select ? select.closest("fieldset") : null;
+    }
+
+    function getLabelColumn(colid) {
+        var label = document.getElementById("fgroup_id_group_" + colid + "_label");
+        return label ? label.closest(".col-md-3") : null;
+    }
+
+    function setRowVisible(colid, visible) {
+        // Plain "element.style.display = ..." loses to Boost Union\'s
+        // .d-flex utility class, which is itself declared with
+        // !important - confirmed against the real rendered page. Forcing
+        // our own !important on the way down beats that; clearing the
+        // inline style entirely on the way back up (rather than forcing
+        // a guessed "flex" value) lets the normal CSS cascade - including
+        // .d-flex - restore whatever it would naturally be.
+        [getRow(colid), getLabelColumn(colid)].forEach(function(el) {
+            if (!el) {
+                return;
+            }
+            if (visible) {
+                el.style.removeProperty("display");
+            } else {
+                el.style.setProperty("display", "none", "important");
+            }
+        });
+    }
+
+    function getPickerItem(colid) {
+        return document.getElementById("local_mondaysync_picker_item_" + colid);
+    }
+
+    function isBroughtOver(colid) {
+        var row = getRow(colid);
+        return !!(row && row.style.display !== "none");
+    }
+
+    function updatePickerCount() {
+        if (!pickerCount) {
+            return;
+        }
+        var available = 0;
+        columnIds.forEach(function(colid) {
+            var item = getPickerItem(colid);
+            if (item && item.style.display !== "none") {
+                available++;
+            }
+        });
+        pickerCount.textContent = countTemplate.replace("__AVAILABLE__", available);
+    }
+
+    function applyPickerSearch() {
+        var term = pickerSearch ? pickerSearch.value.toLowerCase() : "";
+        columnIds.forEach(function(colid) {
+            var item = getPickerItem(colid);
+            if (!item) {
+                return;
+            }
+            if (isBroughtOver(colid)) {
+                item.style.display = "none";
+                return;
+            }
+            var matches = term === "" || item.textContent.toLowerCase().indexOf(term) !== -1;
+            item.style.display = matches ? "" : "none";
+        });
+        updatePickerCount();
+    }
+
+    function bringOver(colid) {
+        var removedflag = document.getElementsByName("removed_" + colid)[0];
+        if (removedflag) {
+            removedflag.value = "0";
+        }
+        setRowVisible(colid, true);
+        applyPickerSearch();
+    }
+
+    function removeMapping(colid) {
+        var target = document.getElementById("id_target_" + colid);
+        var direction = document.getElementById("id_direction_" + colid);
+        var allowclear = document.getElementById("id_allowclear_" + colid);
+        if (target) {
+            target.value = "";
+        }
+        if (direction) {
+            direction.value = "toMoodle";
+        }
+        if (allowclear) {
+            allowclear.checked = false;
+        }
+
+        var removedflag = document.getElementsByName("removed_" + colid)[0];
+        if (removedflag) {
+            removedflag.value = "1";
+        }
+
+        setRowVisible(colid, false);
+
+        var item = getPickerItem(colid);
+        if (item) {
+            var checkbox = item.querySelector("input[type=checkbox]");
+            if (checkbox) {
+                checkbox.checked = false;
+            }
+        }
+
+        applyPickerSearch();
+    }
+
+    columnIds.forEach(function(colid) {
+        setRowVisible(colid, !!initiallyMapped[colid]);
+    });
+    applyPickerSearch();
+
+    if (pickerSearch) {
+        pickerSearch.addEventListener("input", applyPickerSearch);
+    }
+
+    if (bringOverBtn) {
+        bringOverBtn.addEventListener("click", function() {
+            columnIds.forEach(function(colid) {
+                var item = getPickerItem(colid);
+                if (!item || item.style.display === "none") {
+                    return;
+                }
+                var checkbox = item.querySelector("input[type=checkbox]");
+                if (checkbox && checkbox.checked) {
+                    bringOver(colid);
+                }
+            });
+        });
+    }
+
+    document.addEventListener("click", function(e) {
+        var btn = e.target.closest ? e.target.closest(".local-mondaysync-remove-btn") : null;
+        if (btn) {
+            e.preventDefault();
+            removeMapping(btn.getAttribute("data-colid"));
+        }
+    });
+})();
+';
     }
 }

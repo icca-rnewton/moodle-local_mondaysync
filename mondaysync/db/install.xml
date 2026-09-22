@@ -32,12 +32,13 @@
         <INDEX NAME="boardid" UNIQUE="true" FIELDS="boardid"/>
       </INDEXES>
     </TABLE>
-    <TABLE NAME="local_mondaysync_cache" COMMENT="Last-seen value per Monday.com item/column, used to detect changes between polls">
+    <TABLE NAME="local_mondaysync_cache" COMMENT="Last-seen value per Monday.com item/column, used to detect changes between polls. userid is denormalised here (2026, Titus review #17) specifically so GDPR export/delete requests can find a user's cache rows directly, rather than needing to trace back through log history that's subject to its own retention purge and can be gone by the time a request is processed.">
       <FIELDS>
         <FIELD NAME="id" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="true"/>
         <FIELD NAME="monday_itemid" TYPE="char" LENGTH="32" NOTNULL="true" SEQUENCE="false"/>
         <FIELD NAME="monday_columnid" TYPE="char" LENGTH="100" NOTNULL="true" SEQUENCE="false"/>
         <FIELD NAME="value" TYPE="text" NOTNULL="false" SEQUENCE="false"/>
+        <FIELD NAME="userid" TYPE="int" LENGTH="10" NOTNULL="false" SEQUENCE="false"/>
         <FIELD NAME="timemodified" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false"/>
       </FIELDS>
       <KEYS>
@@ -45,6 +46,7 @@
       </KEYS>
       <INDEXES>
         <INDEX NAME="itemcolumn" UNIQUE="true" FIELDS="monday_itemid, monday_columnid"/>
+        <INDEX NAME="userid" UNIQUE="false" FIELDS="userid"/>
       </INDEXES>
     </TABLE>
     <TABLE NAME="local_mondaysync_log" COMMENT="Audit log of sync attempts, changes made, and skips/errors">
@@ -69,7 +71,7 @@
         <INDEX NAME="timecreated" UNIQUE="false" FIELDS="timecreated"/>
       </INDEXES>
     </TABLE>
-    <TABLE NAME="local_mondaysync_manual_email" COMMENT="Permanent record of accounts already sent their manual-auth welcome/password email, so it's never sent twice even if auth flips away from and back to manual">
+    <TABLE NAME="local_mondaysync_manual_email" COMMENT="Permanent per-user marker: a row's existence means this account was created by local_mondaysync (seeded at creation time regardless of initial auth), gating whether the manual-auth welcome/password email can ever fire for it. timesent distinguishes eligible-but-not-yet-sent (0) from already-sent (a real timestamp), so it's also never sent twice even if auth flips away from and back to manual.">
       <FIELDS>
         <FIELD NAME="id" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="true"/>
         <FIELD NAME="userid" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false"/>

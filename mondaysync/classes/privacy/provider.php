@@ -46,10 +46,15 @@ use core_privacy\local\request\writer;
  *   welcome email, tied to userid - kept indefinitely (unlike the log,
  *   which is subject to a retention purge) so the email is never sent
  *   twice.
- * - local_mondaysync_cache: last-seen Monday.com column values, keyed by
- *   Monday item/column rather than Moodle userid. Not covered here as
- *   user-exportable/deletable data - it holds no direct link to a Moodle
- *   account and self-corrects on the next sync regardless.
+ * - local_mondaysync_cache: last-seen Monday.com column values for "Both
+ *   ways" mappings, used to detect genuine conflicts. Stores userid
+ *   directly - excluding it purely because it has no direct userid
+ *   column would miss the point: the *values* stored (an old address,
+ *   phone number, etc.) are still real personal data regardless of how
+ *   the table is indexed. Storing userid directly (rather than tracing it
+ *   via log history, which is itself subject to a retention purge and can
+ *   be gone by the time a request is processed) makes export/delete
+ *   reliable.
  * - Monday.com itself: this plugin sends each user's ID Number to
  *   Monday.com as part of matching board rows to Moodle accounts, and (for
  *   boards configured to create accounts) reads personal data the other
@@ -82,6 +87,16 @@ class provider implements
             'privacy:metadata:local_mondaysync_manual_email'
         );
 
+        $collection->add_database_table(
+            'local_mondaysync_cache',
+            [
+                'userid' => 'privacy:metadata:local_mondaysync_cache:userid',
+                'value' => 'privacy:metadata:local_mondaysync_cache:value',
+                'timemodified' => 'privacy:metadata:local_mondaysync_cache:timemodified',
+            ],
+            'privacy:metadata:local_mondaysync_cache'
+        );
+
         $collection->add_external_location_link(
             'monday.com',
             [
@@ -101,7 +116,8 @@ class provider implements
         $contextlist = new contextlist();
 
         if ($DB->record_exists('local_mondaysync_log', ['userid' => $userid])
-            || $DB->record_exists('local_mondaysync_manual_email', ['userid' => $userid])) {
+            || $DB->record_exists('local_mondaysync_manual_email', ['userid' => $userid])
+            || $DB->record_exists('local_mondaysync_cache', ['userid' => $userid])) {
             $contextlist->add_system_context();
         }
 
@@ -118,6 +134,7 @@ class provider implements
 
         $userlist->add_from_sql('userid', "SELECT DISTINCT userid FROM {local_mondaysync_log} WHERE userid IS NOT NULL", []);
         $userlist->add_from_sql('userid', "SELECT DISTINCT userid FROM {local_mondaysync_manual_email}", []);
+        $userlist->add_from_sql('userid', "SELECT DISTINCT userid FROM {local_mondaysync_cache} WHERE userid IS NOT NULL", []);
     }
 
     public static function export_user_data(approved_contextlist $contextlist): void {
@@ -166,6 +183,23 @@ class provider implements
                     ]]
                 );
             }
+
+            $cacherecords = $DB->get_records('local_mondaysync_cache', ['userid' => $user->id], 'timemodified ASC');
+            if (!empty($cacherecords)) {
+                $cachedata = [];
+                foreach ($cacherecords as $record) {
+                    $cachedata[] = (object) [
+                        'monday_item_id' => $record->monday_itemid,
+                        'monday_column_id' => $record->monday_columnid,
+                        'value' => $record->value,
+                        'timemodified' => transform::datetime($record->timemodified),
+                    ];
+                }
+                writer::with_context($context)->export_data(
+                    [get_string('pluginname', 'local_mondaysync')],
+                    (object) ['synccache' => $cachedata]
+                );
+            }
         }
     }
 
@@ -178,6 +212,12 @@ class provider implements
 
         $DB->delete_records('local_mondaysync_log');
         $DB->delete_records('local_mondaysync_manual_email');
+        // Only clear the userid link, not the whole cache row - the row
+        // itself is still needed for ordinary sync change-detection to
+        // keep working for whoever's still matched to that item; it's the
+        // *personal data link* being erased, not the plugin's own
+        // operational state for an item that may still be actively synced.
+        $DB->set_field('local_mondaysync_cache', 'userid', null, []);
     }
 
     public static function delete_data_for_user(approved_contextlist $contextlist): void {
@@ -191,6 +231,7 @@ class provider implements
             }
             $DB->delete_records('local_mondaysync_log', ['userid' => $user->id]);
             $DB->delete_records('local_mondaysync_manual_email', ['userid' => $user->id]);
+            $DB->set_field('local_mondaysync_cache', 'userid', null, ['userid' => $user->id]);
         }
     }
 
@@ -210,5 +251,6 @@ class provider implements
         [$insql, $inparams] = $DB->get_in_or_equal($userids, SQL_PARAMS_NAMED);
         $DB->delete_records_select('local_mondaysync_log', "userid $insql", $inparams);
         $DB->delete_records_select('local_mondaysync_manual_email', "userid $insql", $inparams);
+        $DB->set_field_select('local_mondaysync_cache', 'userid', null, "userid $insql", $inparams);
     }
 }

@@ -66,6 +66,34 @@ if ($hassiteconfig) {
         PARAM_INT
     ));
 
+    // Moodle Workplace multi-tenancy (only shown if that plugin is
+    // installed). 2026 addition (external review, item 5): without this,
+    // any value in a board's per-row tenant column that happened to match
+    // any tenant name site-wide would provision the new account into
+    // that tenant - given tenancy is meant to be an isolation boundary
+    // between separate organisations/cohorts, this restricts which
+    // tenants externally-influenced Monday data is ever allowed to
+    // select. Deliberately does NOT restrict a board's own admin-
+    // configured default tenant, which is a trusted choice made in the
+    // mapping wizard, not something Monday data controls.
+    if (class_exists('\tool_tenant\manager')) {
+        $tenantchoices = [];
+        foreach (\tool_tenant\tenancy::get_tenants() as $tenant) {
+            $label = $tenant->name;
+            if (!empty($tenant->idnumber)) {
+                $label .= ' (' . $tenant->idnumber . ')';
+            }
+            $tenantchoices[$tenant->id] = $label;
+        }
+        $settings->add(new admin_setting_configmulticheckbox(
+            'local_mondaysync/allowedprovisioningtenants',
+            get_string('allowedprovisioningtenants', 'local_mondaysync'),
+            get_string('allowedprovisioningtenants_desc', 'local_mondaysync'),
+            [], // Default: nothing pre-checked - an admin must deliberately opt tenants in.
+            $tenantchoices
+        ));
+    }
+
     // Individual boards (board ID, matching column, field mappings) are
     // managed on the Connected Boards page, not here.
 

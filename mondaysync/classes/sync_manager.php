@@ -110,11 +110,20 @@ class sync_manager {
         $deletedlogs = $DB->count_records_select('local_mondaysync_log', 'timecreated < :cutoff', ['cutoff' => $cutoff]);
         $DB->delete_records_select('local_mondaysync_log', 'timecreated < :cutoff', ['cutoff' => $cutoff]);
 
-        $deletedcache = $DB->count_records_select('local_mondaysync_cache', 'timemodified < :cutoff', ['cutoff' => $cutoff]);
-        $DB->delete_records_select('local_mondaysync_cache', 'timemodified < :cutoff', ['cutoff' => $cutoff]);
-
-        if ($deletedlogs > 0 || $deletedcache > 0) {
-            mtrace("local_mondaysync: cleanup - removed $deletedlogs log row(s) and $deletedcache cache row(s) older than $days day(s).");
+        // 2026 fix (external review, item 3 / previously fixed and lost):
+        // local_mondaysync_cache is NOT audit history - it's the live
+        // baseline "both ways" mappings use to tell a genuine conflict
+        // apart from one side simply catching up. Purging it on the same
+        // schedule as the log meant a field that had simply stayed
+        // unchanged for longer than the retention period lost its
+        // baseline entirely - the next sync would then treat Monday's
+        // current value as if it had just changed, generating a spurious
+        // rewrite. The cache is no longer purged by age at all; a
+        // genuinely orphaned row (its item/column long gone from Monday)
+        // is just inert dead weight from then on, not a correctness risk,
+        // so there's nothing to gain from removing it proactively.
+        if ($deletedlogs > 0) {
+            mtrace("local_mondaysync: cleanup - removed $deletedlogs log row(s) older than $days day(s).");
         }
     }
 
@@ -134,6 +143,11 @@ class sync_manager {
 
         try {
             $livecolumns = $client->get_board_columns($board->boardid);
+        } catch (api_unavailable_exception $e) {
+            // 2026 fix (external review, item 7): let this propagate
+            // rather than swallowing it like an ordinary board-specific
+            // error - see the exception class's own docblock for why.
+            throw $e;
         } catch (\Throwable $e) {
             mtrace('local_mondaysync: board "' . $board->name . '" - failed to fetch columns: ' . $e->getMessage());
             $this->log($DB, $board->id, '(board)', null, null, null, null, 'error',
@@ -176,14 +190,28 @@ class sync_manager {
                         'User creation is configured but the following column(s) no longer exist on this board: ' .
                         implode(', ', $missingcolumns) . ' - check Connected Boards > Configure mapping.');
                 } else {
-                    $cancreate = true;
                     $triggercolumnid = trim((string)$board->createtriggercolumnid);
                     $statusindices = $this->resolve_trigger_status_indices($livecolumns, $triggercolumnid);
                     if ($statusindices['created'] === null || $statusindices['error'] === null) {
+                        // 2026 fix (external review, item 3 / previously
+                        // fixed and lost): $cancreate used to be set to
+                        // true before this check, so creation still
+                        // proceeded even with no way to report a failure
+                        // back to Monday. Since a failed attempt never
+                        // changes anything on the Monday side (the
+                        // trigger column stays at "Create user" forever),
+                        // that meant the same failing creation retried on
+                        // every single run indefinitely, silently
+                        // generating repeated log entries and update
+                        // comments. Block creation entirely for this
+                        // board until both status options actually exist
+                        // - same treatment as a missing required column.
                         $this->log($DB, $board->id, '(board)', null, null, null, null, 'warning',
                             'The user-creation trigger column is missing a status option this needs - it must have both "' .
                             mapping_util::STATUS_CREATED . '" and "' . mapping_util::STATUS_ERROR .
-                            '" defined as options on Monday.com (any casing is fine, but both need to exist).');
+                            '" defined as options on Monday.com (any casing is fine, but both need to exist). User creation is paused for this board until both exist.');
+                    } else {
+                        $cancreate = true;
                     }
                 }
             }
@@ -191,6 +219,8 @@ class sync_manager {
 
         try {
             $items = $client->get_all_board_items($board->boardid);
+        } catch (api_unavailable_exception $e) {
+            throw $e;
         } catch (\Throwable $e) {
             mtrace('local_mondaysync: board "' . $board->name . '" - failed to fetch items: ' . $e->getMessage());
             $this->log($DB, $board->id, '(board)', null, null, null, null, 'error',
@@ -344,8 +374,30 @@ class sync_manager {
         // that explicitly with get_records() rather than get_record(),
         // which would throw dml_multiple_records_exception and abort the
         // rest of this run rather than just skipping the row.
-        $matches = $DB->get_records('user', ['idnumber' => $idnumber, 'deleted' => 0], '',
+        $rawmatches = $DB->get_records('user', ['idnumber' => $idnumber, 'deleted' => 0], '',
             'id, idnumber, city, department, institution, address, phone1, phone2, description, firstname, lastname, alternatename, auth, suspended, lastlogin');
+
+        // Restored (was missing from a stale copy of this file): site
+        // administrators and the guest account must never be matched,
+        // modified, or created against - regardless of what ID Number
+        // happens to be set on them. If a protected account matches,
+        // stop entirely for this row rather than falling through to
+        // "no match, maybe create" or silently processing other matches.
+        $matches = [];
+        $matchedprotected = false;
+        foreach ($rawmatches as $matchid => $matchuser) {
+            if (is_siteadmin($matchid) || isguestuser($matchid)) {
+                $matchedprotected = true;
+                continue;
+            }
+            $matches[$matchid] = $matchuser;
+        }
+
+        if ($matchedprotected) {
+            $this->log($DB, $board->id, $itemid, null, null, null, null, 'skipped',
+                'ID Number "' . $idnumber . '" matches a site administrator or the guest account - this row is never processed against a protected account.');
+            return;
+        }
 
         if (empty($matches)) {
             if ($cancreate) {
@@ -545,6 +597,14 @@ class sync_manager {
             return;
         }
 
+        // 2026 fix (previously fixed and lost): mark this account as one
+        // this plugin created, regardless of its initial auth method -
+        // this is what gates whether the welcome email/password-reset
+        // mechanism is ever allowed to touch this account's password at
+        // all. An account this plugin did NOT create is never eligible,
+        // full stop.
+        $this->mark_account_as_plugin_created($DB, $newuserid);
+
         // Tenant assignment (Moodle Workplace multi-tenancy, if installed)
         // happens immediately, before anything else - specifically before
         // the welcome email below, since that email's content/login URL
@@ -555,7 +615,7 @@ class sync_manager {
         }
 
         if ($newuser->auth === 'manual' && !empty($board->createemailpassword)) {
-            $this->send_manual_password_email_once($DB, $board, $itemid, $newuserid);
+            $this->send_manual_password_email_once($DB, $client, $board, $itemid, $newuserid);
         }
 
         if ($statusindices['created'] !== null) {
@@ -573,15 +633,33 @@ class sync_manager {
     /**
      * Assign a newly-created account to a Moodle Workplace tenant, if this
      * board has tenant handling configured. Resolution order:
-     * 1. The per-row Monday column, if configured and its text matches a
-     *    real tenant name (case-insensitive) - a warning is logged if it's
-     *    set but doesn't match anything, rather than silently ignored.
+     * 1. The per-row Monday column, if configured, its text matches a real
+     *    tenant name (case-insensitive), AND that tenant is in the site's
+     *    "tenants permitted for Monday-driven provisioning" allowlist. A
+     *    warning is logged if the column value is set but doesn't match
+     *    anything, or matches a tenant not on the allowlist, rather than
+     *    silently ignored either way.
      * 2. The board's configured default tenant, used whenever (1) doesn't
-     *    resolve to anything (blank column, no column configured, or an
-     *    unmatched name).
+     *    resolve to anything (blank column, no column configured, an
+     *    unmatched name, or a match outside the allowlist). This is a
+     *    deliberate, trusted choice an admin made in the mapping wizard
+     *    (gated behind moodle/site:config, the same trust tier as any
+     *    other config in this plugin) - the allowlist deliberately does
+     *    NOT apply here, only to the per-row column value, which is
+     *    externally-influenced Monday data rather than an admin's own
+     *    choice.
      * 3. If neither resolves to a tenant, nothing is done - Workplace's
      *    own default tenant behaviour applies, exactly as if this feature
      *    didn't exist.
+     *
+     * 2026 fix (external review, item 5): previously, any value in the
+     * per-row column that happened to match any tenant name site-wide
+     * would provision the new account into that tenant - given Workplace
+     * tenancy is meant to be an isolation boundary between separate
+     * organisations/cohorts, letting arbitrary externally-influenced
+     * board data cross that boundary was a real safety gap. The allowlist
+     * closes it for the column-driven path specifically, without
+     * restricting the board's own trusted default-tenant setting.
      *
      * Uses \tool_tenant\manager::allocate_user() and
      * \tool_tenant\tenancy::get_tenants() - the documented API for this
@@ -594,6 +672,7 @@ class sync_manager {
      */
     protected function assign_tenant(\moodle_database $DB, \stdClass $board, string $itemid, array $item, int $newuserid): void {
         $tenants = \tool_tenant\tenancy::get_tenants();
+        $allowedtenantids = $this->get_allowed_provisioning_tenant_ids();
 
         $tenantid = null;
         $columnid = trim((string)($board->createtenantcolumnid ?? ''));
@@ -601,15 +680,21 @@ class sync_manager {
         if ($columnid !== '' && array_key_exists($columnid, $item['columns'])) {
             $requestedname = trim($item['columns'][$columnid]['text'] ?? '');
             if ($requestedname !== '') {
+                $matchedid = null;
                 foreach ($tenants as $tenant) {
                     if (strcasecmp(trim($tenant->name), $requestedname) === 0) {
-                        $tenantid = (int)$tenant->id;
+                        $matchedid = (int)$tenant->id;
                         break;
                     }
                 }
-                if ($tenantid === null) {
+                if ($matchedid === null) {
                     $this->log($DB, $board->id, $itemid, $newuserid, 'tenant', null, $requestedname, 'warning',
                         '"' . $requestedname . '" doesn\'t match any Moodle Workplace tenant name - falling back to this board\'s default tenant, if one is configured.');
+                } else if ($allowedtenantids !== null && !in_array($matchedid, $allowedtenantids, true)) {
+                    $this->log($DB, $board->id, $itemid, $newuserid, 'tenant', null, $requestedname, 'warning',
+                        '"' . $requestedname . '" matches a real tenant, but that tenant isn\'t in the site\'s "tenants permitted for Monday-driven provisioning" allowlist - falling back to this board\'s default tenant, if one is configured. Add it to the allowlist in local_mondaysync settings if this should be allowed.');
+                } else {
+                    $tenantid = $matchedid;
                 }
             }
         }
@@ -627,11 +712,34 @@ class sync_manager {
 
         try {
             (new \tool_tenant\manager())->allocate_user($newuserid, $tenantid, 'local_mondaysync', 'Assigned via Monday.com board sync');
-            $this->log($DB, $board->id, $itemid, $newuserid, 'tenant', null, $tenants[$tenantid]->name, 'updated', null);
+            // 2026 fix (external review, item 5): this path only ever runs
+            // on a brand-new account (assign_tenant() is only called from
+            // process_user_creation()), so there's never a prior
+            // tenant_user record - allocate_user() therefore always fires
+            // tenant_user_created, never tenant_user_updated. Logging this
+            // as 'updated' didn't match what actually happened; 'created'
+            // does, consistent with the account-creation log entry itself.
+            $this->log($DB, $board->id, $itemid, $newuserid, 'tenant', null, $tenants[$tenantid]->name, 'created', null);
         } catch (\Throwable $e) {
             $this->log($DB, $board->id, $itemid, $newuserid, 'tenant', null, null, 'error',
                 'Account was created, but tenant assignment failed: ' . $e->getMessage());
         }
+    }
+
+    /**
+     * The site-level allowlist of tenant IDs Monday-driven provisioning
+     * (the per-row column, specifically) is permitted to select - null if
+     * the setting has never been configured (meaning: no restriction,
+     * matching this feature's original behaviour rather than silently
+     * blocking everything the first time it's used after upgrade), empty
+     * array if explicitly configured with nothing allowed.
+     */
+    protected function get_allowed_provisioning_tenant_ids(): ?array {
+        $raw = get_config('local_mondaysync', 'allowedprovisioningtenants');
+        if ($raw === false || $raw === '') {
+            return null;
+        }
+        return array_map('intval', explode(',', $raw));
     }
 
     /**
@@ -689,7 +797,11 @@ class sync_manager {
             // one exact string - this field's too consequential to
             // silently misinterpret, so an unrecognised value is an error,
             // not a guess.
-            $normalised = mapping_util::parse_suspended_value($mondayvalue);
+            $normalised = mapping_util::parse_suspended_value(
+                $mondayvalue,
+                $board->suspendedlabelyes ?? null,
+                $board->suspendedlabelno ?? null
+            );
 
             if ($normalised === null && in_array($direction, ['toMoodle', 'both'], true)) {
                 // Only relevant when this value could actually be written
@@ -747,10 +859,35 @@ class sync_manager {
             }
         }
 
+        if ($mapping['type'] === 'date' && $mondayvalue !== '') {
+            // 2026 fix (external review, item 3): Monday's raw date-column
+            // text can include a time component ('2026-07-22 14:30:00')
+            // even though Moodle's side is always canonicalised to
+            // date-only ('2026-07-22' via moodle_date_to_canonical()).
+            // Comparing the two directly meant a date mapping could never
+            // match even when genuinely unchanged, rewriting on every
+            // single poll. Canonicalise Monday's side the same way before
+            // comparing - unconditionally (not direction-gated), since
+            // even a toMonday-only mapping needs an accurate comparison
+            // to decide whether a push is actually needed.
+            try {
+                $mondayvalue = $this->moodle_date_to_canonical($this->parse_monday_date($mondayvalue));
+            } catch (\Throwable $e) {
+                $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], null, $mondayvalue, 'error',
+                    'Could not interpret "' . $mondayvalue . '" as a date: ' . $e->getMessage());
+                return;
+            }
+        }
+
         if ($direction === 'toMoodle') {
             if ($mondayvalue !== $moodlevalue) {
-                $this->apply_to_moodle_and_maybe_email($DB, $board, $itemid, $user->id, $mapping, $mondayvalue);
-                $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], $moodlevalue, $mondayvalue, 'updated', null);
+                if ($this->blocked_by_clear_protection($mapping, $mondayvalue)) {
+                    $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], $moodlevalue, $mondayvalue, 'skipped',
+                        'Monday.com column is blank - left this field unchanged rather than clearing it (clearing on blank is off for this mapping; enable "Allow blank to clear this field" in the mapping wizard if that\'s wanted here).');
+                } else {
+                    $this->apply_to_moodle_and_maybe_email($DB, $client, $board, $itemid, $user->id, $mapping, $mondayvalue);
+                    $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], $moodlevalue, $mondayvalue, 'updated', null);
+                }
             }
             return;
         }
@@ -772,10 +909,15 @@ class sync_manager {
             // mapping would. Avoids a spurious "conflict" purely because
             // there's nothing to compare against yet.
             if ($mondayvalue !== $moodlevalue) {
-                $this->apply_to_moodle_and_maybe_email($DB, $board, $itemid, $user->id, $mapping, $mondayvalue);
-                $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], null, $mondayvalue, 'updated', null);
+                if ($this->blocked_by_clear_protection($mapping, $mondayvalue)) {
+                    $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], null, $mondayvalue, 'skipped',
+                        'Monday.com column is blank - left this field unchanged rather than clearing it (clearing on blank is off for this mapping; enable "Allow blank to clear this field" in the mapping wizard if that\'s wanted here).');
+                } else {
+                    $this->apply_to_moodle_and_maybe_email($DB, $client, $board, $itemid, $user->id, $mapping, $mondayvalue);
+                    $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], null, $mondayvalue, 'updated', null);
+                }
             }
-            $this->set_cached_value($DB, $itemid, $columnid, $mondayvalue);
+            $this->set_cached_value($DB, $itemid, $columnid, $mondayvalue, $user->id);
             return;
         }
 
@@ -790,29 +932,56 @@ class sync_manager {
             if ($mondayvalue === $moodlevalue) {
                 // Both sides coincidentally ended up at the same value -
                 // nothing to push, just bring the cache up to date.
-                $this->set_cached_value($DB, $itemid, $columnid, $mondayvalue);
+                $this->set_cached_value($DB, $itemid, $columnid, $mondayvalue, $user->id);
+                return;
+            }
+            if ($this->blocked_by_clear_protection($mapping, $mondayvalue)) {
+                $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], $moodlevalue, $mondayvalue, 'skipped',
+                    'Monday.com column is blank - left this field unchanged rather than clearing it (clearing on blank is off for this mapping; enable "Allow blank to clear this field" in the mapping wizard if that\'s wanted here).');
                 return;
             }
             // Genuine conflict: both sides changed, to different values,
             // since the last sync. Monday.com wins.
-            $this->apply_to_moodle_and_maybe_email($DB, $board, $itemid, $user->id, $mapping, $mondayvalue);
+            $this->apply_to_moodle_and_maybe_email($DB, $client, $board, $itemid, $user->id, $mapping, $mondayvalue);
             $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], $moodlevalue, $mondayvalue, 'conflict',
                 'Both Monday.com and Moodle changed this field since the last sync - Monday.com\'s value was kept.');
-            $this->set_cached_value($DB, $itemid, $columnid, $mondayvalue);
+            $this->set_cached_value($DB, $itemid, $columnid, $mondayvalue, $user->id);
             return;
         }
 
         if ($mondaychanged) {
-            $this->apply_to_moodle_and_maybe_email($DB, $board, $itemid, $user->id, $mapping, $mondayvalue);
+            if ($this->blocked_by_clear_protection($mapping, $mondayvalue)) {
+                $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], $cached, $mondayvalue, 'skipped',
+                    'Monday.com column is blank - left this field unchanged rather than clearing it (clearing on blank is off for this mapping; enable "Allow blank to clear this field" in the mapping wizard if that\'s wanted here).');
+                return;
+            }
+            $this->apply_to_moodle_and_maybe_email($DB, $client, $board, $itemid, $user->id, $mapping, $mondayvalue);
             $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], $cached, $mondayvalue, 'updated', null);
-            $this->set_cached_value($DB, $itemid, $columnid, $mondayvalue);
+            $this->set_cached_value($DB, $itemid, $columnid, $mondayvalue, $user->id);
             return;
         }
 
         // Only Moodle changed.
         $this->apply_to_monday($client, $board, $itemid, $columnid, $mapping, $moodlevalue);
         $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], $cached, $moodlevalue, 'updated', null);
-        $this->set_cached_value($DB, $itemid, $columnid, $moodlevalue);
+        $this->set_cached_value($DB, $itemid, $columnid, $moodlevalue, $user->id);
+    }
+
+    /**
+     * Whether a would-be write into Moodle should be blocked because it's
+     * a blank value that would clear an existing field, and this specific
+     * mapping hasn't explicitly opted in to allowing that.
+     *
+     * Restored (was missing from a stale copy of this file): a blank
+     * Monday cell used to always be treated as a real value to sync,
+     * meaning it could silently clear genuine profile data (address,
+     * phone number, etc.) across every matched user if a column was ever
+     * left unpopulated by mistake. Clearing is opt-in per mapping - blank
+     * means "no value given, leave it alone" unless a mapping has
+     * specifically been configured to allow it.
+     */
+    protected function blocked_by_clear_protection(array $mapping, string $newvalue): bool {
+        return $newvalue === '' && empty($mapping['allowclear']);
     }
 
     /**
@@ -894,12 +1063,20 @@ class sync_manager {
      * both's baseline-adoption, both's conflict/catch-up cases) gets the
      * same behaviour without repeating the check at each call site.
      */
-    protected function apply_to_moodle_and_maybe_email(\moodle_database $DB, \stdClass $board, string $itemid, int $userid, array $mapping, string $newvalue): void {
+    protected function apply_to_moodle_and_maybe_email(\moodle_database $DB, monday_client $client, \stdClass $board, string $itemid, int $userid, array $mapping, string $newvalue): void {
         $this->apply_to_moodle($userid, $mapping, $newvalue);
 
         if ($mapping['type'] === 'advanced' && $mapping['field'] === 'auth'
             && $newvalue === 'manual' && !empty($board->createemailpassword)) {
-            $this->send_manual_password_email_once($DB, $board, $itemid, $userid);
+            $this->send_manual_password_email_once($DB, $client, $board, $itemid, $userid);
+        }
+
+        // Restored (was missing from a stale copy of this file): a write
+        // that actually suspends the account must also terminate its
+        // active sessions - otherwise someone already logged in stays
+        // logged in despite being marked suspended.
+        if ($mapping['type'] === 'advanced' && $mapping['field'] === 'suspended' && $newvalue === '1') {
+            \core\session\manager::destroy_user_sessions($userid);
         }
     }
 
@@ -911,11 +1088,65 @@ class sync_manager {
      * Tracked in a dedicated table rather than the sync log, since the
      * log is subject to the retention-period purge and this needs to be
      * permanent for as long as the account exists.
+     *
+     * 2026 fix (external review, item 4 / previously fixed and lost): a
+     * row's mere *existence* means "this account was created by this
+     * plugin" (seeded at creation time in process_user_creation(),
+     * regardless of the account's initial auth), not "already emailed".
+     * timesent distinguishes three states, all in one column (no schema
+     * change needed): 0 = eligible, not yet attempted; negative = an
+     * attempt started at abs(timesent) and never resolved (crash-safety,
+     * see below); positive = genuinely sent at this timestamp. Previously
+     * there was no check at all for whether an account had been created
+     * by this plugin - any existing account (a real person's real,
+     * already-in-use account) whose auth was mapped to "manual" for any
+     * reason would silently have its password regenerated and emailed.
+     *
+     * Moodle's own setnew_password_and_mail() resets the password BEFORE
+     * attempting delivery - if delivery fails, the account already has a
+     * new password nobody was told. That ordering lives inside core and
+     * isn't something this plugin controls without reimplementing the
+     * reset itself, so rather than fight it, two things are done well
+     * instead: (1) the negative-timestamp marker is written *before*
+     * calling it, so a process interrupted mid-call is safely detected
+     * and retried next run rather than silently leaving the row looking
+     * like "never attempted" or (if the crash happened right after a
+     * successful send) double-sent; (2) a failed send posts a Monday
+     * update explaining the account needs a manual password reset,
+     * making the stranded state visible where Ops will actually see it,
+     * not just an entry in Moodle's own log.
      */
-    protected function send_manual_password_email_once(\moodle_database $DB, \stdClass $board, string $itemid, int $userid): void {
-        if ($DB->record_exists('local_mondaysync_manual_email', ['userid' => $userid])) {
+    protected function send_manual_password_email_once(\moodle_database $DB, monday_client $client, \stdClass $board, string $itemid, int $userid): void {
+        $record = $DB->get_record('local_mondaysync_manual_email', ['userid' => $userid]);
+
+        if ($record === false) {
+            // No row at all - this account wasn't created by this plugin.
+            // Never touch its password.
             return;
         }
+
+        $timesent = (int) $record->timesent;
+
+        if ($timesent > 0) {
+            return; // Already sent successfully.
+        }
+
+        if ($timesent < 0) {
+            // A previous attempt started but never resolved - either
+            // still genuinely in flight (implausible; a single email
+            // send resolves in seconds, not minutes) or the process was
+            // interrupted mid-attempt. Only safe to retry once enough
+            // time has passed that "still in flight" isn't realistic.
+            if ((time() - abs($timesent)) < 10 * MINSECS) {
+                return;
+            }
+        }
+
+        // Mark "attempt in progress" before calling into core, so a
+        // crash during the send itself is detected and retried next run
+        // rather than the row staying stuck looking untried forever.
+        $record->timesent = -time();
+        $DB->update_record('local_mondaysync_manual_email', $record);
 
         global $CFG;
         require_once($CFG->dirroot . '/user/lib.php');
@@ -930,21 +1161,50 @@ class sync_manager {
         }
 
         if ($sent) {
-            $record = new \stdClass();
-            $record->userid = $userid;
+            set_user_preference('auth_forcepasswordchange', 1, $userid);
             $record->timesent = time();
-            $DB->insert_record('local_mondaysync_manual_email', $record);
+            $DB->update_record('local_mondaysync_manual_email', $record);
             $this->log($DB, $board->id, $itemid, $userid, 'auth', null, null, 'emailed',
-                'Sent the new-password welcome email for this manual-auth account.');
+                'Sent the new-password welcome email for this manual-auth account (a password change will be required at next login).');
         } else {
             // setnew_password_and_mail() returns false rather than
-            // throwing when the mail server rejects it - don't mark this
-            // as sent, but also don't loop retrying it every poll; it'll
-            // only be attempted again on a genuine future transition back
-            // into "manual".
+            // throwing when the mail server rejects it. The password has
+            // already been reset by this point (core's own behaviour,
+            // not something reorderable from here) - back to "eligible"
+            // so a genuine future transition back into "manual" retries
+            // it, and post an update directly on the Monday item so this
+            // doesn't sit invisible in Moodle's log while a real person
+            // can't log in.
+            $record->timesent = 0;
+            $DB->update_record('local_mondaysync_manual_email', $record);
+            try {
+                $client->create_update($itemid, 'This account\'s password was reset for the manual-auth welcome email, '
+                    . 'but the email itself failed to send (check the server\'s mail logs). The account currently has a '
+                    . 'password nobody has been told - a site admin should manually trigger a password reset for this '
+                    . 'user via Site administration, or set them to a different auth method.');
+            } catch (\Throwable $e) {
+                mtrace('local_mondaysync: failed to post welcome-email-failure update to item ' . $itemid . ': ' . $e->getMessage());
+            }
             $this->log($DB, $board->id, $itemid, $userid, 'auth', null, null, 'error',
-                'Attempted to send the manual-auth welcome email, but it failed (check the server\'s mail logs) - will not retry automatically unless auth changes away from and back to manual.');
+                'Password was reset for the welcome email, but sending it failed (check the server\'s mail logs) - '
+                . 'the account currently has a password nobody has been told. Will retry automatically only if auth '
+                . 'changes away from and back to manual; a Monday update was also posted on this item.');
         }
+    }
+
+    /**
+     * Mark an account as created by this plugin, eligible for the
+     * once-only manual-auth welcome email later (regardless of its
+     * initial auth method) - called once, right after creation.
+     */
+    protected function mark_account_as_plugin_created(\moodle_database $DB, int $userid): void {
+        if ($DB->record_exists('local_mondaysync_manual_email', ['userid' => $userid])) {
+            return;
+        }
+        $record = new \stdClass();
+        $record->userid = $userid;
+        $record->timesent = 0;
+        $DB->insert_record('local_mondaysync_manual_email', $record);
     }
 
     /**
@@ -986,12 +1246,30 @@ class sync_manager {
             // we just need Monday's date text converted to one.
             $data->{'profile_field_' . $mapping['field']} = $this->parse_monday_date($newvalue);
             profile_save_data($data);
+            // 2026 fix (external review, item 6): profile_save_data()
+            // just calls each field's own edit_save_data() directly and
+            // fires no event of any kind (confirmed against core source)
+            // - unlike user_update_user(), which fires user_updated
+            // itself for standard/advanced fields. Without this, a
+            // custom-field-only change was invisible to Workplace
+            // Dynamic Rules and anything else that depends on this
+            // event. Fired per mapping here, matching the granularity
+            // user_update_user() already uses above (a poll with several
+            // changed fields for one user fires several events, same as
+            // it already did for standard/advanced fields) - a fuller
+            // per-user batching (one event even when multiple fields
+            // change together) is a real structural change to how this
+            // sync loop is organised, not a one-line fix, and is worth
+            // its own separate pass if the redundant firing turns out to
+            // matter in practice.
+            \core\event\user_updated::create_from_userid($userid)->trigger();
         } else {
             require_once($CFG->dirroot . '/user/profile/lib.php');
             $data = new \stdClass();
             $data->id = $userid;
             $data->{'profile_field_' . $mapping['field']} = $newvalue;
             profile_save_data($data);
+            \core\event\user_updated::create_from_userid($userid)->trigger();
         }
     }
 
@@ -1051,7 +1329,7 @@ class sync_manager {
         return $record ? $record->value : null;
     }
 
-    protected function set_cached_value(\moodle_database $DB, string $itemid, string $columnid, string $value): void {
+    protected function set_cached_value(\moodle_database $DB, string $itemid, string $columnid, string $value, int $userid): void {
         $record = $DB->get_record('local_mondaysync_cache', [
             'monday_itemid' => $itemid,
             'monday_columnid' => $columnid,
@@ -1059,6 +1337,7 @@ class sync_manager {
 
         if ($record) {
             $record->value = $value;
+            $record->userid = $userid;
             $record->timemodified = time();
             $DB->update_record('local_mondaysync_cache', $record);
         } else {
@@ -1066,6 +1345,7 @@ class sync_manager {
             $record->monday_itemid = $itemid;
             $record->monday_columnid = $columnid;
             $record->value = $value;
+            $record->userid = $userid;
             $record->timemodified = time();
             $DB->insert_record('local_mondaysync_cache', $record);
         }

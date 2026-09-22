@@ -40,7 +40,9 @@ $string['accountsubdomain'] = 'Monday.com account subdomain';
 $string['accountsubdomain_desc'] = 'Your team\'s subdomain, e.g. <code>coic-company</code> for <code>coic-company.monday.com</code>. Used to build "Go to board" links on the Connected Boards page. Filled in automatically the first time you add or edit a board using its full URL rather than just its ID.';
 
 $string['logretentiondays'] = 'Sync log/cache retention (days)';
-$string['logretentiondays_desc'] = 'Sync log entries and cached column values older than this are automatically deleted at the end of each sync run. The log holds personal data (old/new profile field values), so keeping this reasonably short is good practice as well as good housekeeping. Set to 0 to keep everything indefinitely (not recommended).';
+$string['logretentiondays_desc'] = 'Sync log entries older than this are automatically deleted at the end of each sync run. The log holds personal data (old/new profile field values), so keeping this reasonably short is good practice as well as good housekeeping. Set to 0 to keep everything indefinitely (not recommended). This no longer affects the internal sync cache, which is never purged by age - it holds active sync state, not audit history, and purging it by age could cause a stable field to be incorrectly treated as freshly changed.';
+$string['allowedprovisioningtenants'] = 'Tenants permitted for Monday-driven provisioning';
+$string['allowedprovisioningtenants_desc'] = 'Restricts which tenants a board\'s per-row Monday.com column is allowed to select when creating a new account (User creation > Tenant name column). Only applies to that per-row value - a board\'s own Default tenant setting is a trusted admin choice and is never restricted here. <strong>If nothing is ticked, there is no restriction at all</strong> - any tenant name in the column matches, exactly as before this setting existed. Tick specific tenants here to lock this down.';
 
 $string['boardid'] = 'Monday.com board ID';
 
@@ -115,6 +117,13 @@ $string['directionintro'] = 'Monday → Moodle (default): only Monday.com can ch
 $string['directiontomoodle'] = 'Monday → Moodle';
 $string['directiontomonday'] = 'Moodle → Monday';
 $string['directionboth'] = 'Both ways';
+$string['allowclear'] = 'Allow blank to clear this field';
+$string['columnfiltersearch'] = 'Search columns by name…';
+$string['bringoverformapping'] = 'Bring over for mapping →';
+$string['removemapping'] = 'Remove';
+$string['pickercount'] = '{$a->available} column(s) available to add';
+$string['pickerheader'] = 'Select columns to map';
+$string['pickerintro'] = 'Tick the columns you want to configure, then bring them over below. Already-mapped columns start below automatically - "Remove" sends one back here and clears its mapping.';
 $string['only'] = 'only';
 
 // Advanced fields (core account properties, not ordinary profile data).
@@ -125,6 +134,8 @@ $string['advancedfield_lastlogin'] = 'Last login';
 $string['advancedwarning'] = '"Advanced" fields below control login access directly, not ordinary profile data - used well (e.g. suspending an account when Monday marks someone as departed) they\'re powerful, but a bad or unexpected value here can genuinely lock someone out. For <strong>Authentication method</strong>, the Monday column\'s value must exactly match an auth plugin shortname enabled on this site (e.g. "manual", "nologin") - anything else effectively breaks that account\'s login. For <strong>Account suspended</strong>, map to a column whose value is exactly "0" or "1". Double-check both before turning on a live sync.';
 $string['neverloggedin'] = 'Never logged in';
 $string['directionrestricted'] = '{$a->field} can only be synced {$a->directions}.';
+$string['duplicatetarget'] = 'More than one Monday.com column is mapped to this same Moodle field - each field can only be fed by one column, since two columns updating the same field would fight each other on every sync. Change one of them to "Do not sync" or a different field.';
+$string['triggercolumnalsomapped'] = 'This column is also mapped to a Moodle field in the section above - the trigger column is managed entirely by the user-creation process and can\'t also be used as an ordinary field mapping. Change its mapping above to "Do not sync", or choose a different trigger column.';
 
 // Orphaned mappings (deleted Moodle field or Monday column).
 $string['orphanedfieldoption'] = '⚠ Deleted: {$a} (kept as configured - pick a new target, or "Do not sync" to clear it)';
@@ -173,6 +184,7 @@ $string['createdefaulttenant_desc'] = 'Used whenever the tenant column above is 
 
 // Errors.
 $string['errormondayhttp'] = 'Monday.com API returned an unexpected HTTP status: {$a}';
+$string['errormondayapiunavailable'] = 'Monday.com API appears to be unavailable (HTTP status: {$a}) - rate limited, a server error, or unreachable entirely.';
 $string['errormondayresponse'] = 'Could not decode Monday.com API response: {$a}';
 $string['errormondaygraphql'] = 'Monday.com API returned GraphQL errors: {$a}';
 $string['errornotconfigured'] = 'local_mondaysync is not fully configured (missing API token). Skipping sync.';
@@ -188,6 +200,10 @@ $string['privacy:metadata:local_mondaysync_log:timecreated'] = 'When the change 
 $string['privacy:metadata:local_mondaysync_manual_email'] = 'A permanent record of whether a manual-auth account has already been sent its new-password welcome email, kept indefinitely (unlike the sync log) so the email is never sent twice.';
 $string['privacy:metadata:local_mondaysync_manual_email:userid'] = 'The Moodle user who was, or will be, sent the welcome email.';
 $string['privacy:metadata:local_mondaysync_manual_email:timesent'] = 'When the welcome email was sent.';
+$string['privacy:metadata:local_mondaysync_cache'] = 'The last-seen value of each "Both ways" mapped field, used to detect a genuine conflict between Moodle and Monday.com rather than one side simply catching up. Kept only as long as the field is still actively mapped and matched to that user; if a user\'s personal data is deleted, this is anonymised (the link to that user is removed) rather than deleted outright, since the row may still be needed for the sync itself to keep working correctly for whoever remains matched to that Monday.com item.';
+$string['privacy:metadata:local_mondaysync_cache:userid'] = 'The Moodle user this cached value was most recently synced for.';
+$string['privacy:metadata:local_mondaysync_cache:value'] = 'The last-seen value for this field.';
+$string['privacy:metadata:local_mondaysync_cache:timemodified'] = 'When this value was last updated.';
 $string['privacy:metadata:mondaycom'] = 'To match a Monday.com board row to a Moodle account, this plugin sends the user\'s ID Number to Monday.com. For any field mapped with a "Moodle → Monday" or "Both ways" direction, that field\'s current value is also sent to Monday.com to keep the corresponding board column in sync. In the other direction, if a board is configured to create new Moodle accounts, this plugin reads personal data (first name, last name, email address, and the value used as username) from that board\'s columns to create the account.';
 $string['privacy:metadata:mondaycom:idnumber'] = 'The Moodle user\'s ID Number profile field.';
 $string['privacy:metadata:mondaycom:fieldvalue'] = 'The current value of any profile field mapped with a Moodle → Monday, or Both ways, sync direction.';

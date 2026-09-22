@@ -112,10 +112,23 @@ if ($mform->is_cancelled()) {
     foreach ($columns as $col) {
         $targetelname = 'target_' . $col['id'];
         $directionelname = 'direction_' . $col['id'];
+        $allowclearelname = 'allowclear_' . $col['id'];
+        $removedelname = 'removed_' . $col['id'];
+
+        // Checked first, deliberately independent of whatever the grouped
+        // <select> above actually reports - a plain, standalone hidden
+        // field the "Remove" button sets directly is a simpler, more
+        // reliable signal than trusting a dropdown's value survived
+        // Moodle's own group-element export/submission pipeline intact.
+        if (!empty($data->$removedelname)) {
+            continue;
+        }
+
         if (!empty($data->$targetelname)) {
             [$type, $field] = explode(':', $data->$targetelname, 2);
             $direction = $data->$directionelname ?? \local_mondaysync\mapping_util::DEFAULT_DIRECTION;
-            $mappings[$col['id']] = ['type' => $type, 'field' => $field, 'direction' => $direction];
+            $allowclear = !empty($data->$allowclearelname);
+            $mappings[$col['id']] = ['type' => $type, 'field' => $field, 'direction' => $direction, 'allowclear' => $allowclear];
         }
     }
 

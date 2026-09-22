@@ -70,6 +70,28 @@ class monday_client {
         $curl->setopt([
             'CURLOPT_CONNECTTIMEOUT' => 10,
             'CURLOPT_TIMEOUT' => 30,
+            // 2026 fix (external review, release blocker #2): Moodle's
+            // core \curl class defaults CURLOPT_SSL_VERIFYPEER to 0 and
+            // CURLOPT_SSL_VERIFYHOST to a non-hostname-checking value
+            // unless a caller explicitly overrides them (confirmed
+            // against core source) - meaning without this, every request
+            // carrying the Monday.com API token (capable of creating and
+            // modifying real accounts) had no certificate verification at
+            // all, a genuine MITM exposure.
+            'CURLOPT_SSL_VERIFYPEER' => true,
+            'CURLOPT_SSL_VERIFYHOST' => 2,
+            // Also explicitly disable redirect-following. Monday's fixed
+            // GraphQL endpoint never legitimately redirects, so there's
+            // no functional reason to allow it - and Moodle's own
+            // cross-host Authorization-header-stripping protection on
+            // redirects only checks $this->options['CURLOPT_HTTPHEADER'],
+            // which headers set via setHeader() (as used here) never
+            // populate (confirmed against core source: setHeader() only
+            // ever writes to the separate $this->header property). That
+            // protection structurally cannot activate for this caller, so
+            // the safest fix is to never follow a redirect in the first
+            // place rather than rely on stripping working correctly.
+            'CURLOPT_FOLLOWLOCATION' => false,
         ]);
 
         $payload = json_encode([
@@ -79,9 +101,26 @@ class monday_client {
 
         $response = $curl->post(self::API_URL, $payload);
         $info = $curl->get_info();
+        $httpcode = (int)($info['http_code'] ?? 0);
 
-        if (empty($info['http_code']) || (int)$info['http_code'] !== 200) {
-            throw new \moodle_exception('errormondayhttp', 'local_mondaysync', '', $info['http_code'] ?? 'unknown');
+        // 2026 fix (external review, item 7): HTTP 429 (rate limited),
+        // 5xx (server error), and a completely failed/empty response
+        // (http_code 0 - the request never got a response at all, e.g.
+        // a connection failure) are treated as API-availability failures,
+        // not ordinary per-request errors - these affect every board
+        // equally and aren't something retrying the same board fixes.
+        // Thrown as a distinct exception type so the caller can let this
+        // one propagate and genuinely fail the scheduled task, rather
+        // than logging and swallowing it like a routine board-specific
+        // issue (which is the right thing to do for, say, one board's
+        // matching column being misconfigured, but not for the whole
+        // API being down).
+        if ($httpcode === 429 || $httpcode >= 500 || $httpcode === 0) {
+            throw new api_unavailable_exception('errormondayapiunavailable', 'local_mondaysync', '', $httpcode);
+        }
+
+        if ($httpcode !== 200) {
+            throw new \moodle_exception('errormondayhttp', 'local_mondaysync', '', $httpcode);
         }
 
         $decoded = json_decode($response, true);

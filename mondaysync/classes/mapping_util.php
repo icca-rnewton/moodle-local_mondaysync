@@ -31,15 +31,20 @@ defined('MOODLE_INTERNAL') || die();
  * between the sync engine and the column-mapping wizard so both agree on
  * exactly the same format.
  *
- * Format: one mapping per line, "monday_column_id => type:field:direction",
- * where type is one of 'standard', 'custom', 'date', or 'advanced', and
- * direction is one of 'toMoodle' (Monday -> Moodle, the original one-way
- * behaviour and the default), 'toMonday' (Moodle -> Monday), or 'both'.
+ * Format: one mapping per line,
+ * "monday_column_id => type:field:direction:allowclear", where type is one
+ * of 'standard', 'custom', 'date', or 'advanced', direction is one of
+ * 'toMoodle' (Monday -> Moodle, the original one-way behaviour and the
+ * default), 'toMonday' (Moodle -> Monday), or 'both', and allowclear is
+ * '1'/'0' - whether a blank Monday value is allowed to clear the Moodle
+ * field (default '0', opt-in, since always clearing on blank could
+ * silently wipe real profile data if a column was ever left unpopulated
+ * by mistake).
  *
- * The direction segment is optional on read for backward compatibility with
- * mappings saved before two-way sync existed (a bare "type:field" with no
- * third part defaults to 'toMoodle', preserving exactly the old behaviour).
- * It's always written on save.
+ * Both the direction and allowclear segments are optional on read, for
+ * backward compatibility with mappings saved before each existed (missing
+ * direction defaults to 'toMoodle', missing allowclear defaults to '0' -
+ * both preserving prior behaviour exactly). Both are always written on save.
  */
 class mapping_util {
 
@@ -88,13 +93,29 @@ class mapping_util {
      * label their Status column however reads naturally to them, rather
      * than needing to match one exact string.
      *
+     * @param string $text Text from the Monday.com column.
+     * @param string|null $customyeslabel This board's configured "label written when suspended" - also accepted as input.
+     * @param string|null $customnolabel This board's configured "label written when not suspended" - also accepted as input.
      * @return string|null '1', '0', or null if the text isn't recognised.
      */
-    public static function parse_suspended_value(string $text): ?string {
+    public static function parse_suspended_value(string $text, ?string $customyeslabel = null, ?string $customnolabel = null): ?string {
         $normalised = strtolower(trim($text));
 
         $truthy = ['yes', 'y', '1', 'true', 'suspended'];
         $falsy = ['no', 'n', '0', 'false', 'not suspended'];
+
+        // A board's own configured labels (used when *writing* to Monday)
+        // must also be accepted on the way back *in* - otherwise a
+        // 'toMonday' mapping can never recognise its own just-written
+        // label on the next poll, comparing canonical '0'/'1' against raw
+        // label text forever and rewriting on every single run even
+        // though nothing actually changed.
+        if ($customyeslabel !== null && $customyeslabel !== '' && strtolower(trim($customyeslabel)) === $normalised) {
+            return '1';
+        }
+        if ($customnolabel !== null && $customnolabel !== '' && strtolower(trim($customnolabel)) === $normalised) {
+            return '0';
+        }
 
         if (in_array($normalised, $truthy, true)) {
             return '1';
@@ -129,10 +150,11 @@ class mapping_util {
                 continue;
             }
 
-            $parts = array_map('trim', explode(':', $target, 3));
+            $parts = array_map('trim', explode(':', $target, 4));
             $type = $parts[0] ?? '';
             $field = $parts[1] ?? '';
             $direction = $parts[2] ?? self::DEFAULT_DIRECTION;
+            $allowclear = ($parts[3] ?? '0') === '1';
 
             if (!in_array($type, ['standard', 'custom', 'date', 'advanced'], true) || $field === '') {
                 continue;
@@ -141,7 +163,7 @@ class mapping_util {
                 $direction = self::DEFAULT_DIRECTION;
             }
 
-            $mappings[$columnid] = ['type' => $type, 'field' => $field, 'direction' => $direction];
+            $mappings[$columnid] = ['type' => $type, 'field' => $field, 'direction' => $direction, 'allowclear' => $allowclear];
         }
 
         return $mappings;
@@ -218,7 +240,8 @@ class mapping_util {
         $lines = [];
         foreach ($mappings as $columnid => $mapping) {
             $direction = $mapping['direction'] ?? self::DEFAULT_DIRECTION;
-            $lines[] = $columnid . ' => ' . $mapping['type'] . ':' . $mapping['field'] . ':' . $direction;
+            $allowclear = !empty($mapping['allowclear']) ? '1' : '0';
+            $lines[] = $columnid . ' => ' . $mapping['type'] . ':' . $mapping['field'] . ':' . $direction . ':' . $allowclear;
         }
         return implode("\n", $lines);
     }
