@@ -127,6 +127,23 @@ if ($mform->is_cancelled()) {
         if (!empty($data->$targetelname)) {
             [$type, $field] = explode(':', $data->$targetelname, 2);
             $direction = $data->$directionelname ?? \local_mondaysync\mapping_util::DEFAULT_DIRECTION;
+
+            // If this field only ever allows exactly one direction (e.g.
+            // lastlogin, timecreated - both toMonday-only since Moodle
+            // overwrites them itself), that direction is authoritative
+            // here regardless of what was submitted - the server
+            // enforces this, not the client. Keeps this correct even if
+            // client-side JS has a bug, is disabled, or a request is
+            // crafted directly - and means the direction control can
+            // safely be fully disabled client-side for these fields
+            // (a disabled <select> doesn't submit its value at all,
+            // which would otherwise silently fall through to
+            // DEFAULT_DIRECTION and be wrong for a toMonday-only field).
+            $singledirection = \local_mondaysync\mapping_util::ADVANCED_FIELDS[$field] ?? null;
+            if ($type === 'advanced' && $singledirection !== null && count($singledirection) === 1) {
+                $direction = $singledirection[0];
+            }
+
             $allowclear = !empty($data->$allowclearelname);
             $mappings[$col['id']] = ['type' => $type, 'field' => $field, 'direction' => $direction, 'allowclear' => $allowclear];
         }

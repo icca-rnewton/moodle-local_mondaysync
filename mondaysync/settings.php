@@ -58,6 +58,16 @@ if ($hassiteconfig) {
         PARAM_ALPHANUMEXT
     ));
 
+    // Which Standard, Advanced, and custom-profile-field-category fields
+    // the mapping wizard's dropdown actually offers. A custom
+    // admin_setting subclass (see its own docblock for why) - referenced
+    // by fully-qualified name since this file itself isn't namespaced.
+    $settings->add(new \local_mondaysync\admin_setting_fieldpicker(
+        'local_mondaysync/enabledfields',
+        get_string('enabledfields', 'local_mondaysync'),
+        get_string('enabledfields_desc', 'local_mondaysync')
+    ));
+
     $settings->add(new admin_setting_configtext(
         'local_mondaysync/logretentiondays',
         get_string('logretentiondays', 'local_mondaysync'),

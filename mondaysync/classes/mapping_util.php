@@ -48,28 +48,50 @@ defined('MOODLE_INTERNAL') || die();
  */
 class mapping_util {
 
-    /** @var string[] Standard Moodle user fields safe to expose in the mapping wizard. */
+    /**
+     * The full catalog of standard Moodle user fields this plugin knows
+     * how to expose - not necessarily all shown in the mapping wizard's
+     * dropdown at once. Which of these are actually offered on a given
+     * site is controlled by the "Fields available for mapping" setting
+     * (see admin_setting_fieldpicker) - this constant is the ceiling on
+     * what that setting can possibly enable, not the current selection.
+     */
     const SAFE_STANDARD_FIELDS = [
-        'firstname', 'lastname', 'alternatename',
+        'firstname', 'lastname', 'alternatename', 'email', 'idnumber',
         'institution', 'department', 'address',
         'phone1', 'phone2', 'description', 'city',
+        'country', 'lang', 'calendartype',
     ];
 
     /**
      * Advanced (core account-property) fields, each with the set of
-     * directions it's actually allowed to be used in. auth/suspended
-     * genuinely control login access, so an admin choosing these is
-     * expected to understand that risk - the wizard labels them clearly.
-     * lastlogin is restricted to toMonday only: Moodle overwrites it
-     * itself on every real login, so a write into it from Monday would
-     * just get clobbered next time the person signs in.
+     * directions it's actually allowed to be used in. auth/suspended/
+     * username/confirmed/policyagreed genuinely control login access or
+     * account state directly, not ordinary profile data - an admin
+     * choosing to expose these is expected to understand that risk (the
+     * wizard labels them clearly, and the site-level field picker keeps
+     * them off by default, same as the newer standard fields).
+     * lastlogin/timecreated are restricted to toMonday only for a
+     * technical reason rather than a risk one: Moodle overwrites both
+     * itself (on every real login, and once at account creation
+     * respectively), so a write into either from Monday would just get
+     * silently clobbered - there's no point offering a direction that can
+     * never actually take effect.
+     *
+     * Like SAFE_STANDARD_FIELDS, this is the full catalog this plugin
+     * knows about, not necessarily what's currently offered - see
+     * admin_setting_fieldpicker.
      *
      * @var array [fieldname => string[] of allowed directions]
      */
     const ADVANCED_FIELDS = [
         'auth' => ['toMoodle', 'toMonday', 'both'],
         'suspended' => ['toMoodle', 'toMonday', 'both'],
+        'username' => ['toMoodle', 'toMonday', 'both'],
+        'confirmed' => ['toMoodle', 'toMonday', 'both'],
+        'policyagreed' => ['toMoodle', 'toMonday', 'both'],
         'lastlogin' => ['toMonday'],
+        'timecreated' => ['toMonday'],
     ];
 
     /** @var string[] Valid sync directions. */
@@ -77,6 +99,34 @@ class mapping_util {
 
     /** @var string Default direction for mappings saved before direction existed. */
     const DEFAULT_DIRECTION = 'toMoodle';
+
+    /**
+     * Standard fields enabled by default (used as the fallback when the
+     * site's "Fields available for mapping" setting has never been
+     * saved) - exactly the set this plugin has always offered, so
+     * upgrading doesn't change anything for an already-working board.
+     * The newer additions to SAFE_STANDARD_FIELDS (email, idnumber,
+     * country, lang, calendartype) are deliberately not included here -
+     * they're opt-in, an admin has to explicitly enable them.
+     *
+     * @var string[]
+     */
+    const DEFAULT_ENABLED_STANDARD_FIELDS = [
+        'firstname', 'lastname', 'alternatename',
+        'institution', 'department', 'address',
+        'phone1', 'phone2', 'description', 'city',
+    ];
+
+    /**
+     * Same idea as DEFAULT_ENABLED_STANDARD_FIELDS, for advanced fields.
+     * timecreated is included since it was added alongside this same
+     * feature; username/confirmed/policyagreed are deliberately not -
+     * genuinely new, higher-stakes capabilities an admin should
+     * consciously opt into rather than have appear automatically.
+     *
+     * @var string[]
+     */
+    const DEFAULT_ENABLED_ADVANCED_FIELDS = ['auth', 'suspended', 'lastlogin', 'timecreated'];
 
     /**
      * Canonical text this plugin writes to a board's creation-trigger Status
@@ -171,20 +221,31 @@ class mapping_util {
 
     /**
      * Whether a type/field combination is currently valid to sync - i.e.
-     * still on the standard-field whitelist, still a recognised advanced
-     * field, or (for custom/date) still an existing custom profile field.
+     * still on the standard-field catalog AND enabled via the site's
+     * "Fields available for mapping" setting, still a recognised and
+     * enabled advanced field, or (for custom/date) still an existing AND
+     * enabled custom profile field.
+     *
+     * Deliberately checks the site-enabled subset here, not just the full
+     * catalog - if an admin disables a field that's already in use by a
+     * saved mapping, that mapping should show up as orphaned and stop
+     * executing, exactly like it already does when a custom profile
+     * field gets deleted entirely. Same mental model, same machinery,
+     * just one more way a field can stop being valid.
      */
     public static function is_valid_field(string $type, string $field, ?array $customfields = null): bool {
+        $enabled = self::get_enabled_field_keys();
+
         if ($type === 'standard') {
-            return in_array($field, self::SAFE_STANDARD_FIELDS, true);
+            return in_array($field, self::SAFE_STANDARD_FIELDS, true) && in_array('std:' . $field, $enabled, true);
         }
         if ($type === 'advanced') {
-            return array_key_exists($field, self::ADVANCED_FIELDS);
+            return array_key_exists($field, self::ADVANCED_FIELDS) && in_array('adv:' . $field, $enabled, true);
         }
         if ($customfields === null) {
             $customfields = self::get_custom_fields();
         }
-        return array_key_exists($field, $customfields);
+        return array_key_exists($field, $customfields) && in_array('profile:' . $field, $enabled, true);
     }
 
     /**
@@ -249,20 +310,82 @@ class mapping_util {
     /**
      * Fetch the list of custom user profile fields available for mapping.
      *
-     * @return array [shortname => ['name' => display name, 'datatype' => Moodle datatype]]
+     * @return array [shortname => ['name' => display name, 'datatype' => Moodle datatype, 'category' => category display name]]
      */
     public static function get_custom_fields(): array {
         global $DB;
 
-        $fields = $DB->get_records('user_info_field', null, 'sortorder', 'id, shortname, name, datatype');
+        $sql = "SELECT f.id, f.shortname, f.name, f.datatype, c.name AS categoryname
+                  FROM {user_info_field} f
+                  JOIN {user_info_category} c ON c.id = f.categoryid
+              ORDER BY c.sortorder, f.sortorder";
+        $fields = $DB->get_records_sql($sql);
         $out = [];
         foreach ($fields as $field) {
             $out[$field->shortname] = [
                 'name' => format_string($field->name),
                 'datatype' => $field->datatype,
+                'category' => format_string($field->categoryname),
             ];
         }
         return $out;
+    }
+
+    /**
+     * Same as get_custom_fields(), but grouped by category name - for
+     * rendering the mapping dropdown and the site-level field picker,
+     * both of which need custom fields organised by their Moodle-defined
+     * category rather than as one flat list. Preserves the category and
+     * field ordering get_custom_fields() already sorts by.
+     *
+     * @return array [categoryname => [shortname => ['name' => ..., 'datatype' => ...]]]
+     */
+    public static function get_custom_fields_by_category(): array {
+        $grouped = [];
+        foreach (self::get_custom_fields() as $shortname => $info) {
+            $grouped[$info['category']][$shortname] = $info;
+        }
+        return $grouped;
+    }
+
+    /**
+     * The prefixed field keys ('std:firstname', 'adv:auth',
+     * 'profile:favouritecolour') currently enabled for the mapping
+     * dropdown, per the "Fields available for mapping" site setting
+     * (admin_setting_fieldpicker). If that setting has never been
+     * explicitly saved, falls back to a backward-compatible default -
+     * the fields this plugin has always offered, plus every custom
+     * profile field currently on the site - so upgrading to this feature
+     * doesn't silently orphan any already-working board's mappings until
+     * an admin deliberately visits the new setting and changes something.
+     *
+     * Shared by both the admin_setting_fieldpicker class (to know what's
+     * checked when first rendered) and is_valid_field() (to know what's
+     * actually safe to offer/execute) - one source of truth for the
+     * default rather than two copies of the same fallback logic.
+     */
+    public static function get_enabled_field_keys(): array {
+        $raw = get_config('local_mondaysync', 'enabledfields');
+
+        if ($raw === false) {
+            $keys = [];
+            foreach (self::DEFAULT_ENABLED_STANDARD_FIELDS as $field) {
+                $keys[] = 'std:' . $field;
+            }
+            foreach (self::DEFAULT_ENABLED_ADVANCED_FIELDS as $field) {
+                $keys[] = 'adv:' . $field;
+            }
+            foreach (array_keys(self::get_custom_fields()) as $shortname) {
+                $keys[] = 'profile:' . $shortname;
+            }
+            return $keys;
+        }
+
+        if ($raw === '') {
+            return [];
+        }
+
+        return explode(',', $raw);
     }
 
     /**

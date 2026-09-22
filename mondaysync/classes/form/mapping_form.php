@@ -98,26 +98,68 @@ class mapping_form extends \moodleform {
         $mform->addElement('static', 'directionintro', get_string('direction', 'local_mondaysync'),
             get_string('directionintro', 'local_mondaysync'));
 
-        // Build the flat option list shared by every column's "sync to" dropdown.
-        $targetoptions = ['' => get_string('donotsync', 'local_mondaysync')];
+        // Build the grouped option structure shared by every column's "sync
+        // to" dropdown - Standard fields, Advanced fields, then one group
+        // per custom-profile-field category - filtered to only the fields
+        // the site's "Fields available for mapping" setting actually
+        // enables (mapping_util::get_enabled_field_keys()), so a site with
+        // many custom fields doesn't force every column's dropdown to show
+        // all of them regardless of relevance.
+        //
+        // 2026 redesign (dropdown grouping): previously every option
+        // carried a "Standard field: "/"Custom field: "/"Advanced field: "
+        // prefix, which was the main source of the "wall of text" this
+        // redesign addresses - with real headers doing that job instead,
+        // repeating it on every single option became redundant. Genuine
+        // <optgroup> isn't achievable here without breaking form
+        // submission entirely (confirmed against core source:
+        // moodleform::get_data() only ever processes genuinely registered
+        // elements, so a hand-built raw <select> with real <optgroup>
+        // tags would silently never have its value received on save) -
+        // disabled, visually-indented header options are the safe
+        // equivalent that stays a real, working form element.
+        $enabledkeys = \local_mondaysync\mapping_util::get_enabled_field_keys();
 
+        $standardchoices = [];
         foreach (\local_mondaysync\mapping_util::SAFE_STANDARD_FIELDS as $fieldname) {
-            $label = get_string('standardfieldoption', 'local_mondaysync', $this->standard_field_label($fieldname));
-            $targetoptions['standard:' . $fieldname] = $label;
+            if (in_array('std:' . $fieldname, $enabledkeys, true)) {
+                $standardchoices['standard:' . $fieldname] = $this->standard_field_label($fieldname);
+            }
         }
 
-        foreach ($customfields as $shortname => $info) {
-            $type = ($info['datatype'] === 'datetime') ? 'date' : 'custom';
-            $a = new \stdClass();
-            $a->name = $info['name'];
-            $a->shortname = $shortname;
-            $a->datatype = $info['datatype'];
-            $targetoptions[$type . ':' . $shortname] = get_string('customfieldoption', 'local_mondaysync', $a);
-        }
-
+        $advancedchoices = [];
         foreach (\local_mondaysync\mapping_util::ADVANCED_FIELDS as $fieldname => $alloweddirections) {
-            $targetoptions['advanced:' . $fieldname] = get_string('advancedfieldoption', 'local_mondaysync',
-                $this->advanced_field_label($fieldname, $alloweddirections));
+            if (in_array('adv:' . $fieldname, $enabledkeys, true)) {
+                $advancedchoices['advanced:' . $fieldname] = $this->advanced_field_label($fieldname, $alloweddirections);
+            }
+        }
+
+        $targetgroups = [];
+        if (!empty($standardchoices)) {
+            $targetgroups[] = ['header' => get_string('fieldpicker_standard', 'local_mondaysync'), 'choices' => $standardchoices];
+        }
+        if (!empty($advancedchoices)) {
+            $targetgroups[] = ['header' => get_string('fieldpicker_advanced', 'local_mondaysync'), 'choices' => $advancedchoices];
+        }
+        foreach (\local_mondaysync\mapping_util::get_custom_fields_by_category() as $categoryname => $fields) {
+            $choices = [];
+            foreach ($fields as $shortname => $info) {
+                if (!in_array('profile:' . $shortname, $enabledkeys, true)) {
+                    continue;
+                }
+                $type = ($info['datatype'] === 'datetime') ? 'date' : 'custom';
+                $choices[$type . ':' . $shortname] = $info['name'] . ' (' . $shortname . ')';
+            }
+            if (!empty($choices)) {
+                $targetgroups[] = ['header' => $categoryname, 'choices' => $choices];
+            }
+        }
+
+        // Flat list of every real (non-header) value across every group,
+        // for validation() to check submissions against.
+        $this->validtargetoptions = [''];
+        foreach ($targetgroups as $group) {
+            $this->validtargetoptions = array_merge($this->validtargetoptions, array_keys($group['choices']));
         }
 
         $mform->addElement('static', 'advancedwarning', '', $this->warning(get_string('advancedwarning', 'local_mondaysync')));
@@ -126,6 +168,7 @@ class mapping_form extends \moodleform {
 
         global $PAGE;
         $PAGE->requires->js_amd_inline($this->column_picker_js($columns, $rawmappings));
+        $PAGE->requires->js_amd_inline($this->direction_lock_js($columns));
 
         // Shared by every column's direction dropdown.
         $directionoptions = [
@@ -139,26 +182,32 @@ class mapping_form extends \moodleform {
             $directionelname = 'direction_' . $col['id'];
             $label = $this->column_label($col);
 
-            // Start from the shared options, but this column may need one
-            // extra "orphaned" option added just for it, if its saved
-            // target no longer exists.
-            $columnoptionsforselect = $targetoptions;
+            // This column may need one extra "orphaned" option, if its
+            // saved target isn't currently offered (no longer exists, or
+            // has been disabled via the site's field picker since it was
+            // set) - grouped under its own header, same visual treatment
+            // as every other group, rather than a bare option with no
+            // context.
+            $orphangroup = null;
             $saved = $rawmappings[$col['id']] ?? null;
-
             if ($saved !== null) {
                 $current = $saved['type'] . ':' . $saved['field'];
-                if (!array_key_exists($current, $columnoptionsforselect)) {
+                if (!in_array($current, $this->validtargetoptions, true)) {
                     $desc = \local_mondaysync\mapping_util::describe_mapping_target($saved, $customfields);
-                    $columnoptionsforselect[$current] = get_string('orphanedfieldoption', 'local_mondaysync', $desc);
+                    $orphangroup = ['header' => get_string('orphanedgroupheader', 'local_mondaysync'), 'choices' => [$current => $desc]];
                     $this->allowedorphanvalues[$col['id']] = $current;
+                    $this->validtargetoptions[] = $current;
                 }
             }
+
+            $targetselect = $mform->createElement('select', $targetelname, '', []);
+            $this->populate_grouped_select($targetselect, $targetgroups, $orphangroup);
 
             $removehtml = '<button type="button" class="btn btn-link btn-sm p-0 ml-2 local-mondaysync-remove-btn"'
                 . ' data-colid="' . s($col['id']) . '">' . s(get_string('removemapping', 'local_mondaysync')) . '</button>';
 
             $group = [
-                $mform->createElement('select', $targetelname, '', $columnoptionsforselect),
+                $targetselect,
                 $mform->createElement('select', $directionelname, '', $directionoptions),
                 $mform->createElement('advcheckbox', $allowclearelname, '', get_string('allowclear', 'local_mondaysync')),
                 $mform->createElement('static', 'remove_' . $col['id'], '', $removehtml),
@@ -181,15 +230,13 @@ class mapping_form extends \moodleform {
             $mform->setType('removed_' . $col['id'], PARAM_BOOL);
 
             if ($saved !== null) {
-                $current = $saved['type'] . ':' . $saved['field'];
-                if (array_key_exists($current, $columnoptionsforselect)) {
-                    $mform->setDefault($targetelname, $current);
-                }
+                // Guaranteed to exist as a real, selectable option by this
+                // point - either it was already in $targetgroups, or the
+                // orphan handling above added it via $orphangroup.
+                $mform->setDefault($targetelname, $saved['type'] . ':' . $saved['field']);
                 $mform->setDefault($directionelname, $saved['direction']);
             }
         }
-
-        $this->validtargetoptions = array_keys($targetoptions);
 
         // --- Orphaned mappings: Monday column no longer exists ---
         $orphanedbycolumn = array_diff_key($rawmappings, array_flip($livecolumnids));
@@ -215,12 +262,10 @@ class mapping_form extends \moodleform {
 
         $mform->addElement('text', 'suspendedlabelyes', get_string('suspendedlabelyes', 'local_mondaysync'), ['size' => 30]);
         $mform->setType('suspendedlabelyes', PARAM_TEXT);
-        $mform->addRule('suspendedlabelyes', get_string('required'), 'required', null, 'server');
         $mform->setDefault('suspendedlabelyes', $this->_customdata['suspendedlabelyes'] ?: 'Suspended');
 
         $mform->addElement('text', 'suspendedlabelno', get_string('suspendedlabelno', 'local_mondaysync'), ['size' => 30]);
         $mform->setType('suspendedlabelno', PARAM_TEXT);
-        $mform->addRule('suspendedlabelno', get_string('required'), 'required', null, 'server');
         $mform->setDefault('suspendedlabelno', $this->_customdata['suspendedlabelno'] ?: 'Not Suspended');
 
         // --- User creation ---
@@ -316,6 +361,21 @@ class mapping_form extends \moodleform {
 
         if (!in_array($data['matchingcolumnid'], $this->validcolumnids, true)) {
             $errors['matchingcolumnid'] = get_string('invalidselection', 'local_mondaysync');
+        }
+
+        // Validated here rather than via addRule(..., 'required', ...) -
+        // that mechanism forces its containing header section to always
+        // render expanded (confirmed against core forms source: any
+        // client-side required rule inside a header makes Moodle
+        // force-expand it, regardless of setExpanded() never being
+        // called), which was why "Suspended field labels" always opened
+        // by default while "User creation" (validated the same way as
+        // here) didn't.
+        if (trim((string)($data['suspendedlabelyes'] ?? '')) === '') {
+            $errors['suspendedlabelyes'] = get_string('required');
+        }
+        if (trim((string)($data['suspendedlabelno'] ?? '')) === '') {
+            $errors['suspendedlabelno'] = get_string('required');
         }
 
         foreach ($this->_customdata['columns'] as $col) {
@@ -435,9 +495,23 @@ class mapping_form extends \moodleform {
      * strings where they exist.
      */
     protected function standard_field_label(string $fieldname): string {
+        // These two don't have a core string matching the field name
+        // directly (verified against the real lang files rather than
+        // guessed) - 'lang' needs 'preferredlanguage', and 'calendartype'
+        // needs 'preferredcalendar' from the 'calendar' component
+        // specifically, not the default 'moodle' one.
+        $explicit = [
+            'lang' => get_string('preferredlanguage'),
+            'calendartype' => get_string('preferredcalendar', 'calendar'),
+        ];
+        if (isset($explicit[$fieldname])) {
+            return $explicit[$fieldname];
+        }
+
         $corestrings = [
             'firstname', 'lastname', 'city', 'department',
             'institution', 'address', 'phone1', 'phone2', 'description',
+            'email', 'idnumber', 'country',
         ];
         if (in_array($fieldname, $corestrings, true)) {
             return get_string($fieldname);
@@ -457,6 +531,10 @@ class mapping_form extends \moodleform {
             'auth' => get_string('advancedfield_auth', 'local_mondaysync'),
             'suspended' => get_string('advancedfield_suspended', 'local_mondaysync'),
             'lastlogin' => get_string('advancedfield_lastlogin', 'local_mondaysync'),
+            'timecreated' => get_string('advancedfield_timecreated', 'local_mondaysync'),
+            'username' => get_string('advancedfield_username', 'local_mondaysync'),
+            'confirmed' => get_string('advancedfield_confirmed', 'local_mondaysync'),
+            'policyagreed' => get_string('advancedfield_policyagreed', 'local_mondaysync'),
         ];
         $label = $labels[$fieldname] ?? $fieldname;
 
@@ -483,6 +561,51 @@ class mapping_form extends \moodleform {
             return get_string('pluginname', 'auth_' . $authname) . ' (' . $authname . ')';
         } catch (\Throwable $e) {
             return $authname;
+        }
+    }
+
+    /**
+     * Populate a <select> element with "Do not sync", then each group's
+     * disabled header option followed by its real, indented options - the
+     * closest achievable equivalent to <optgroup> that still submits
+     * correctly through moodleform's own element-export mechanism.
+     * Genuine <optgroup> isn't safely achievable here: confirmed against
+     * core source that moodleform::get_data() only ever processes
+     * elements actually registered via addElement()/createElement() (it
+     * calls exportValue() on each one in $this->_elements) - a hand-built
+     * raw <select> with real <optgroup> tags, rendered as a 'static'
+     * element instead of a real form element, would never have its
+     * submitted value picked up at all, silently breaking every save for
+     * that field. Disabled, visually-indented header options stay a
+     * genuine, working form element instead.
+     *
+     * True bold text isn't achievable inside a plain <option> either - a
+     * hard HTML constraint (browsers only ever render option content as
+     * plain text), not a Moodle one. Header rows use a visual convention
+     * instead ("── Heading ──") that reads clearly as "not a selectable
+     * item" even without real bold, and are marked disabled so they
+     * genuinely can't be selected regardless of how they look.
+     *
+     * @param mixed $select The MoodleQuickForm_select element to populate (not type-hinted - not confident enough in the exact class name to risk a wrong hint causing a fatal error).
+     * @param array $groups [['header' => string, 'choices' => [value => label]], ...]
+     * @param array|null $trailinggroup One more group (same shape) added after every other group - used for a column's orphaned-mapping option, which needs its own header but should always sort last.
+     */
+    protected function populate_grouped_select($select, array $groups, ?array $trailinggroup = null): void {
+        $select->addOption(get_string('donotsync', 'local_mondaysync'), '');
+
+        $allgroups = $groups;
+        if ($trailinggroup !== null) {
+            $allgroups[] = $trailinggroup;
+        }
+
+        $indent = "\u{00A0}\u{00A0}\u{00A0}\u{00A0}";
+        $headerindex = 0;
+        foreach ($allgroups as $group) {
+            $headerindex++;
+            $select->addOption('── ' . $group['header'] . ' ──', '__header' . $headerindex . '__', ['disabled' => 'disabled']);
+            foreach ($group['choices'] as $value => $label) {
+                $select->addOption($indent . $label, $value);
+            }
         }
     }
 
@@ -588,6 +711,71 @@ class mapping_form extends \moodleform {
      * Using Moodle's actual page-JS mechanism runs independently of
      * whatever that rebuild does.
      */
+    /**
+     * For every column, greys out and forces the direction dropdown
+     * whenever its target field only ever allows one direction (e.g.
+     * lastlogin, timecreated - both toMonday-only since Moodle overwrites
+     * them itself) - purely a visual/UX aid, giving that clearly *before*
+     * an attempted save rather than only as a validation error after one.
+     * Generic over whatever mapping_util::ADVANCED_FIELDS currently
+     * restricts, so a future single-direction field gets this treatment
+     * automatically rather than needing its own JS added.
+     *
+     * The server (mapping.php), not this script, is what actually
+     * enforces the direction for these fields - disabling the visible
+     * <select> here is safe specifically because a disabled element's
+     * value doesn't submit at all, and mapping.php now forces the
+     * correct direction server-side regardless of what (if anything) was
+     * submitted for these fields.
+     *
+     * Registered via $PAGE->requires->js_amd_inline() rather than an
+     * inline <script>, same reasoning as column_picker_js() - see that
+     * method's own docblock.
+     */
+    protected function direction_lock_js(array $columns): string {
+        $singledirections = [];
+        foreach (\local_mondaysync\mapping_util::ADVANCED_FIELDS as $fieldname => $alloweddirections) {
+            if (count($alloweddirections) === 1) {
+                $singledirections['advanced:' . $fieldname] = $alloweddirections[0];
+            }
+        }
+
+        $columnidsjson = json_encode(array_column($columns, 'id'));
+        $singledirectionsjson = json_encode($singledirections);
+
+        return '
+(function() {
+    var columnIds = ' . $columnidsjson . ';
+    var singleDirections = ' . $singledirectionsjson . ';
+
+    function applyLock(colid) {
+        var targetSelect = document.getElementById("id_target_" + colid);
+        var directionSelect = document.getElementById("id_direction_" + colid);
+        if (!targetSelect || !directionSelect) {
+            return;
+        }
+        var forced = singleDirections[targetSelect.value];
+        if (forced) {
+            directionSelect.value = forced;
+            directionSelect.disabled = true;
+        } else {
+            directionSelect.disabled = false;
+        }
+    }
+
+    columnIds.forEach(function(colid) {
+        applyLock(colid);
+        var targetSelect = document.getElementById("id_target_" + colid);
+        if (targetSelect) {
+            targetSelect.addEventListener("change", function() {
+                applyLock(colid);
+            });
+        }
+    });
+})();
+';
+    }
+
     protected function column_picker_js(array $columns, array $rawmappings): string {
         $initiallymapped = [];
         foreach ($columns as $col) {
@@ -613,34 +801,34 @@ class mapping_form extends \moodleform {
     var bringOverBtn = document.getElementById("local_mondaysync_bringover");
     var pickerCount = document.getElementById("local_mondaysync_picker_count");
 
-    function getRow(colid) {
-        var select = document.getElementById("id_target_" + colid);
-        return select ? select.closest("fieldset") : null;
-    }
-
-    function getLabelColumn(colid) {
-        var label = document.getElementById("fgroup_id_group_" + colid + "_label");
-        return label ? label.closest(".col-md-3") : null;
+    function getRowWrapper(colid) {
+        // The stable, predictable id Moodle gives this row\'s actual outer
+        // wrapper - confirmed directly from the real rendered page
+        // (fgroup_id_group_<colid>), covering both the label column and
+        // the fieldset as descendants in one element, unlike the
+        // fieldset/label-column pair this used to target separately.
+        return document.getElementById("fgroup_id_group_" + colid);
     }
 
     function setRowVisible(colid, visible) {
         // Plain "element.style.display = ..." loses to Boost Union\'s
-        // .d-flex utility class, which is itself declared with
+        // .d-flex/.row utility classes, which are declared with
         // !important - confirmed against the real rendered page. Forcing
         // our own !important on the way down beats that; clearing the
         // inline style entirely on the way back up (rather than forcing
-        // a guessed "flex" value) lets the normal CSS cascade - including
-        // .d-flex - restore whatever it would naturally be.
-        [getRow(colid), getLabelColumn(colid)].forEach(function(el) {
-            if (!el) {
-                return;
-            }
-            if (visible) {
-                el.style.removeProperty("display");
-            } else {
-                el.style.setProperty("display", "none", "important");
-            }
-        });
+        // a guessed value) lets the normal CSS cascade restore whatever
+        // it would naturally be. Hiding the wrapper itself (rather than
+        // just its children) also correctly collapses its own .mb-3
+        // margin, rather than leaving an empty, still-margined box behind.
+        var wrapper = getRowWrapper(colid);
+        if (!wrapper) {
+            return;
+        }
+        if (visible) {
+            wrapper.style.removeProperty("display");
+        } else {
+            wrapper.style.setProperty("display", "none", "important");
+        }
     }
 
     function getPickerItem(colid) {
@@ -648,8 +836,8 @@ class mapping_form extends \moodleform {
     }
 
     function isBroughtOver(colid) {
-        var row = getRow(colid);
-        return !!(row && row.style.display !== "none");
+        var wrapper = getRowWrapper(colid);
+        return !!(wrapper && wrapper.style.display !== "none");
     }
 
     function updatePickerCount() {
@@ -701,6 +889,13 @@ class mapping_form extends \moodleform {
         }
         if (direction) {
             direction.value = "toMoodle";
+            // If this column\'s target was previously a single-direction
+            // field (e.g. timecreated), direction_lock_js() would have
+            // disabled this select - clear that directly here rather
+            // than relying on the other script\'s own change handler,
+            // since resetting .value programmatically doesn\'t fire a
+            // "change" event on its own.
+            direction.disabled = false;
         }
         if (allowclear) {
             allowclear.checked = false;

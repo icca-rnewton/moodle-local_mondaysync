@@ -375,7 +375,7 @@ class sync_manager {
         // which would throw dml_multiple_records_exception and abort the
         // rest of this run rather than just skipping the row.
         $rawmatches = $DB->get_records('user', ['idnumber' => $idnumber, 'deleted' => 0], '',
-            'id, idnumber, city, department, institution, address, phone1, phone2, description, firstname, lastname, alternatename, auth, suspended, lastlogin');
+            'id, idnumber, city, department, institution, address, phone1, phone2, description, firstname, lastname, alternatename, auth, suspended, lastlogin, timecreated');
 
         // Restored (was missing from a stale copy of this file): site
         // administrators and the guest account must never be matched,
@@ -859,6 +859,29 @@ class sync_manager {
             }
         }
 
+        if ($mapping['type'] === 'advanced' && $mapping['field'] === 'username'
+            && $mondayvalue !== '' && in_array($direction, ['toMoodle', 'both'], true)) {
+            // user_update_user() validates username *format* (must be
+            // lowercase, "clean" per PARAM_USERNAME-style rules) but
+            // never checks *uniqueness* against other accounts (confirmed
+            // against core source) - without this guard, a sync could
+            // silently give two different accounts the same username, a
+            // broken, ambiguous state for login. mnethostid-scoped, same
+            // as how Moodle itself treats username uniqueness (unique per
+            // mnet host, not globally).
+            global $CFG;
+            $existing = $DB->get_record('user', [
+                'username' => $mondayvalue,
+                'mnethostid' => $CFG->mnet_localhost_id,
+                'deleted' => 0,
+            ]);
+            if ($existing && (int)$existing->id !== (int)$user->id) {
+                $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], null, $mondayvalue, 'error',
+                    '"' . $mondayvalue . '" is already the username of a different Moodle account (user id ' . $existing->id . ') - value left unchanged to avoid creating a duplicate username.');
+                return;
+            }
+        }
+
         if ($mapping['type'] === 'date' && $mondayvalue !== '') {
             // 2026 fix (external review, item 3): Monday's raw date-column
             // text can include a time component ('2026-07-22 14:30:00')
@@ -1002,6 +1025,14 @@ class sync_manager {
                 // rather than pushing a raw Unix timestamp.
                 $timestamp = (int)($user->lastlogin ?? 0);
                 return $timestamp > 0 ? date('Y-m-d H:i', $timestamp) : get_string('neverloggedin', 'local_mondaysync');
+            }
+            if ($mapping['field'] === 'timecreated') {
+                // Also toMonday-only, same reasoning as lastlogin - this
+                // is always set for a genuinely existing account (unlike
+                // lastlogin, which can be 0 for "never logged in"), so no
+                // fallback string is needed.
+                $timestamp = (int)($user->timecreated ?? 0);
+                return $timestamp > 0 ? date('Y-m-d H:i', $timestamp) : '';
             }
             return trim((string)($user->{$mapping['field']} ?? ''));
         }
