@@ -155,6 +155,12 @@ class sync_manager {
             return;
         }
         $livecolumnids = array_column($livecolumns, 'id');
+        // Monday's own column type ('date', 'text', 'status', etc.) per
+        // column id - needed so the write path can tell when a column is
+        // a genuine Date column (which requires Monday's own structured
+        // date format) apart from a Text/Status column that merely
+        // happens to hold date-looking text.
+        $columntypes = array_column($livecolumns, 'type', 'id');
 
         if (!in_array($matchingcolumnid, $livecolumnids, true)) {
             // The matching column itself is gone - every row on this board
@@ -232,7 +238,7 @@ class sync_manager {
 
         foreach ($items as $item) {
             try {
-                $this->process_item($DB, $client, $board, $item, $matchingcolumnid, $mappings, $statusindices, $cancreate);
+                $this->process_item($DB, $client, $board, $item, $matchingcolumnid, $mappings, $statusindices, $cancreate, $columntypes);
             } catch (\Throwable $e) {
                 // Whatever went wrong with this one item, don't let it take
                 // out every other item on this board (or every other board -
@@ -360,7 +366,7 @@ class sync_manager {
      * apply any changed mapped columns, in whichever direction each mapping
      * is configured for.
      */
-    protected function process_item(\moodle_database $DB, monday_client $client, \stdClass $board, array $item, string $matchingcolumnid, array $mappings, array $statusindices, bool $cancreate): void {
+    protected function process_item(\moodle_database $DB, monday_client $client, \stdClass $board, array $item, string $matchingcolumnid, array $mappings, array $statusindices, bool $cancreate, array $columntypes): void {
         $itemid = $item['id'];
         $idnumber = trim($item['columns'][$matchingcolumnid]['text'] ?? '');
 
@@ -430,7 +436,7 @@ class sync_manager {
             }
 
             try {
-                $this->process_mapping($DB, $client, $board, $itemid, $user, $columnid, $mapping, $item);
+                $this->process_mapping($DB, $client, $board, $itemid, $user, $columnid, $mapping, $item, $columntypes[$columnid] ?? '');
             } catch (\Throwable $e) {
                 $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], null, null, 'error', $e->getMessage());
             }
@@ -785,7 +791,7 @@ class sync_manager {
      * what each side's value was as of the last sync, not just what they
      * are now.
      */
-    protected function process_mapping(\moodle_database $DB, monday_client $client, \stdClass $board, string $itemid, \stdClass $user, string $columnid, array $mapping, array $item): void {
+    protected function process_mapping(\moodle_database $DB, monday_client $client, \stdClass $board, string $itemid, \stdClass $user, string $columnid, array $mapping, array $item, string $mondaycolumntype): void {
         $direction = $mapping['direction'] ?? mapping_util::DEFAULT_DIRECTION;
 
         $mondayvalue = trim($item['columns'][$columnid]['text'] ?? '');
@@ -902,6 +908,20 @@ class sync_manager {
             }
         }
 
+        if ($mapping['type'] === 'custom' && $this->is_checkbox_custom_field($mapping['field'])) {
+            // Same underlying bug shape as the date fix above. Monday's
+            // checkbox column reports its 'text' as literally "v" when
+            // checked and "" when unchecked (confirmed against Monday's
+            // own API docs) - but Moodle's side stores and compares
+            // against a plain '1'/'0'. Comparing "v"/"" directly against
+            // '1'/'0' could never match even when genuinely unchanged,
+            // rewriting on every single poll. "Any non-empty text counts
+            // as checked" mirrors the same permissive rule Moodle's own
+            // PARAM_BOOL cleaning already uses, rather than hardcoding
+            // the literal "v" as a magic string.
+            $mondayvalue = ($mondayvalue !== '') ? '1' : '0';
+        }
+
         if ($direction === 'toMoodle') {
             if ($mondayvalue !== $moodlevalue) {
                 if ($this->blocked_by_clear_protection($mapping, $mondayvalue)) {
@@ -917,7 +937,11 @@ class sync_manager {
 
         if ($direction === 'toMonday') {
             if ($moodlevalue !== $mondayvalue) {
-                $this->apply_to_monday($client, $board, $itemid, $columnid, $mapping, $moodlevalue);
+                $rawtimestamp = null;
+                if ($mapping['type'] === 'advanced' && in_array($mapping['field'], ['lastlogin', 'timecreated'], true)) {
+                    $rawtimestamp = (int)($user->{$mapping['field']} ?? 0);
+                }
+                $this->apply_to_monday($client, $board, $itemid, $columnid, $mapping, $moodlevalue, $mondaycolumntype, $rawtimestamp);
                 $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], $mondayvalue, $moodlevalue, 'updated', null);
             }
             return;
@@ -984,8 +1008,11 @@ class sync_manager {
             return;
         }
 
-        // Only Moodle changed.
-        $this->apply_to_monday($client, $board, $itemid, $columnid, $mapping, $moodlevalue);
+        // Only Moodle changed. Raw timestamp is always null here - a
+        // 'both'-direction mapping can never be lastlogin/timecreated
+        // (both are restricted to toMonday-only), so there's nothing for
+        // it to apply to on this path.
+        $this->apply_to_monday($client, $board, $itemid, $columnid, $mapping, $moodlevalue, $mondaycolumntype, null);
         $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], $cached, $moodlevalue, 'updated', null);
         $this->set_cached_value($DB, $itemid, $columnid, $moodlevalue, $user->id);
     }
@@ -1308,7 +1335,7 @@ class sync_manager {
      * Push a field's current Moodle value to the corresponding Monday.com
      * column.
      */
-    protected function apply_to_monday(monday_client $client, \stdClass $board, string $itemid, string $columnid, array $mapping, string $newvalue): void {
+    protected function apply_to_monday(monday_client $client, \stdClass $board, string $itemid, string $columnid, array $mapping, string $newvalue, string $mondaycolumntype = '', ?int $rawtimestamp = null): void {
         if ($mapping['type'] === 'advanced' && $mapping['field'] === 'suspended') {
             // Convert the canonical '1'/'0' to whichever labels this board
             // is configured to write, since Ops chooses their own wording
@@ -1318,10 +1345,59 @@ class sync_manager {
 
         if ($mapping['type'] === 'date') {
             if ($newvalue === '') {
-                $client->set_column_value_json($board->boardid, $itemid, $columnid, []); // Clears the column.
+                // 2026 fix: confirmed directly against Monday's own Date
+                // column docs - clearing requires an empty string via
+                // change_simple_column_value, not an empty array via the
+                // JSON mutation (which is what this previously sent, and
+                // which Monday rejects outright with a GraphQL error).
+                // This bug almost certainly predates today - it simply
+                // never surfaced before, since nothing had triggered a
+                // genuine blank-date write to test it until now.
+                $client->set_simple_column_value($board->boardid, $itemid, $columnid, '');
             } else {
                 $client->set_column_value_json($board->boardid, $itemid, $columnid, ['date' => $newvalue]);
             }
+        } else if ($mapping['type'] === 'advanced' && in_array($mapping['field'], ['lastlogin', 'timecreated'], true)
+            && $mondaycolumntype === 'date') {
+            // 2026 addition: lastlogin/timecreated can now write to a
+            // genuine Monday "Date" column, not just Text/Status - lets
+            // Ops use Monday's own native date filtering/automations
+            // against this value (e.g. "if last login is before X, do
+            // Y"), which a plain text column can't support. Uses the same
+            // structured JSON mechanism as the 'date' mapping type above,
+            // with both date and time keys (lastlogin/timecreated carry a
+            // meaningful time-of-day, unlike a plain date-only field),
+            // explicitly in UTC per Monday's own documented format for
+            // this column - gmdate() rather than date(), regardless of
+            // the server's configured timezone. A zero timestamp ("never
+            // logged in", or - in principle - no creation time at all)
+            // has no valid date representation, so it clears the column
+            // instead of writing something nonsensical - via an empty
+            // string through the simple mutation, same fix as the 'date'
+            // type above, not the JSON mutation with an empty array.
+            // Validation only allows this combination for
+            // lastlogin/timecreated specifically - every other advanced/
+            // standard/custom field still can't target a genuine Date
+            // column at all, since nothing else here represents a
+            // timestamp.
+            if (empty($rawtimestamp)) {
+                $client->set_simple_column_value($board->boardid, $itemid, $columnid, '');
+            } else {
+                $client->set_column_value_json($board->boardid, $itemid, $columnid, [
+                    'date' => gmdate('Y-m-d', $rawtimestamp),
+                    'time' => gmdate('H:i:s', $rawtimestamp),
+                ]);
+            }
+        } else if ($mapping['type'] === 'custom' && $this->is_checkbox_custom_field($mapping['field'])) {
+            // Confirmed directly against Monday's own API docs - "The
+            // checkbox column does not support change_simple_column_value.
+            // You must use change_multiple_column_values to update
+            // checkbox values." (change_simple_column_value is exactly
+            // what the else branch below uses for everything else) - a
+            // checkbox write was always failing with a GraphQL error
+            // before this fix, never silently, but never actually taking
+            // effect either.
+            $client->set_column_value_json($board->boardid, $itemid, $columnid, ['checked' => ($newvalue === '1')]);
         } else {
             // Covers text and status columns (setting a status by its label
             // text is an officially documented example of this mutation).
@@ -1330,6 +1406,18 @@ class sync_manager {
             // rather than attempted here for every possible column type.
             $client->set_simple_column_value($board->boardid, $itemid, $columnid, $newvalue);
         }
+    }
+
+    /**
+     * Whether a custom profile field's own Moodle datatype is 'checkbox' -
+     * looked up on demand rather than carried as its own mapping type
+     * (unlike 'date', which is a distinct type throughout this class)
+     * since only two call sites need to know this, both narrowly scoped
+     * to write-format and comparison-format handling specifically.
+     */
+    protected function is_checkbox_custom_field(string $shortname): bool {
+        $fields = mapping_util::get_custom_fields();
+        return ($fields[$shortname]['datatype'] ?? null) === 'checkbox';
     }
 
     /**

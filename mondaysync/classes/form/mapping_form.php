@@ -393,6 +393,30 @@ class mapping_form extends \moodleform {
                 continue;
             }
 
+            // A genuine Monday "Date" column (as opposed to a Text or
+            // Status column that merely happens to hold date-looking
+            // text) requires Monday's own structured date format to
+            // write to at all - confirmed directly from a real sync
+            // error: Monday rejected a plain string with a GraphQL
+            // error, and its own error message showed it trying (and
+            // failing) to split that string into date/time parts. This
+            // plugin's 'date' mapping type (a genuine Moodle datetime
+            // custom profile field), and - since this round - the
+            // lastlogin/timecreated advanced fields specifically, both
+            // have that structured write path. Every other type
+            // (standard, custom, and every other advanced field) always
+            // formats its value as a plain readable string, which a Date
+            // column will always reject - caught here with a clear
+            // explanation, rather than left to fail at sync time with a
+            // cryptic Monday API error.
+            $isdatecapable = (strpos($submitted, 'date:') === 0)
+                || ($submitted === 'advanced:lastlogin')
+                || ($submitted === 'advanced:timecreated');
+            if (!empty($submitted) && !$isdatecapable && ($col['type'] ?? '') === 'date') {
+                $errors['group_' . $col['id']] = get_string('cannotmapplaintextodatecolumn', 'local_mondaysync');
+                continue;
+            }
+
             // Advanced fields with a restricted direction set (e.g.
             // lastlogin: Moodle -> Monday only) - catch a mismatched
             // direction here with a clear message, rather than letting it
@@ -401,6 +425,21 @@ class mapping_form extends \moodleform {
             if (!empty($submitted) && strpos($submitted, 'advanced:') === 0) {
                 $advfield = substr($submitted, strlen('advanced:'));
                 $direction = $data[$directionelname] ?? '';
+
+                // Mirrors the same fix in mapping.php's save loop: if this
+                // field only ever allows exactly one direction (e.g.
+                // lastlogin, timecreated), direction_lock_js() disables
+                // the visible <select> for it client-side - and a
+                // disabled element never submits its value at all, so
+                // $direction above would be empty here regardless of
+                // what the UI correctly shows. Without this, validation
+                // rejected the submission before mapping.php's own
+                // server-side forcing logic ever got a chance to run.
+                $singledirection = \local_mondaysync\mapping_util::ADVANCED_FIELDS[$advfield] ?? null;
+                if ($singledirection !== null && count($singledirection) === 1) {
+                    $direction = $singledirection[0];
+                }
+
                 if (!\local_mondaysync\mapping_util::is_direction_allowed('advanced', $advfield, $direction)) {
                     $a = new \stdClass();
                     $a->field = $advfield;
@@ -919,8 +958,27 @@ class mapping_form extends \moodleform {
         applyPickerSearch();
     }
 
+    function hasValidationError(colid) {
+        // Every validation error this form attaches to a specific
+        // column\'s row uses the same group-level key (\'group_<colid>\'),
+        // confirmed by checking every $errors[...] assignment in
+        // validation() - so this one check reliably covers all of them,
+        // current and future, rather than needing a list of specific
+        // error conditions to watch for.
+        var errorspan = document.getElementById("fgroup_id_error_group_" + colid);
+        return !!(errorspan && errorspan.textContent.trim() !== "");
+    }
+
     columnIds.forEach(function(colid) {
-        setRowVisible(colid, !!initiallyMapped[colid]);
+        // A row with a genuine validation error must stay visible
+        // regardless of initiallyMapped - that only reflects the last
+        // successfully SAVED state (rawmappings is read fresh from the
+        // database on every page load, including a validation-failure
+        // redisplay of a submission that hasn\'t saved at all), so on a
+        // failed save it would otherwise hide the exact row explaining
+        // why, leaving the error genuinely invisible and the page
+        // looking like it silently did nothing.
+        setRowVisible(colid, !!initiallyMapped[colid] || hasValidationError(colid));
     });
     applyPickerSearch();
 
