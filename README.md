@@ -122,14 +122,29 @@ offers (a safe standard-field whitelist plus your actual custom fields).
   real API also ensures the proper `tenant_user_created` event fires
   (which anything Workplace itself hangs off tenant assignment, such as
   tenant-branded behaviour, likely depends on).
-- **Manual-auth welcome email now fires on any transition into "manual",
-  not just at creation.** If an account's created with a different
-  default (e.g. `nologin`, for a staged "waiting state" workflow) and its
-  auth is later switched to `manual` via the Advanced `auth` mapping,
-  that now triggers the same welcome email as a creation-time `manual`
-  default would - but only ever once per account, tracked permanently
-  (not subject to the log retention purge), no matter how many times auth
-  flips away from and back to `manual` afterward.
+- **Manual-auth welcome email (plugin-created accounts only).** An account
+  this plugin created gets a new-password welcome email when it is on
+  `manual` auth - at creation, or later if its auth is switched to
+  `manual` (e.g. created as `nologin` for a staged workflow). Accounts the
+  plugin did not create are never touched: a row in
+  `local_mondaysync_manual_email` is the marker for "created by this
+  plugin", and without one no password is ever reset. Each account is
+  emailed only once, tracked permanently (not subject to the log retention
+  purge).
+
+  Moodle resets the password *before* it tries to send, so a send that
+  fails, or is interrupted part-way, leaves an account whose password
+  nobody has been told. The marker therefore records each attempt before
+  it starts. On later syncs, an unfinished attempt is retried
+  automatically for accounts that are still on `manual` auth, not
+  suspended, and have never been used at all (checked across every
+  login/access field - anyone who has been in already has a working
+  password, which a reset would break) - at most 3 attempts in total, no
+  more than once an hour. If those run out, the plugin stops, posts a note
+  on the Monday item and logs it, so a site admin can reset the account
+  themselves. Upgrading from an earlier version seeds the marker for
+  plugin-created accounts that are still unused, identified from the sync
+  log (so only accounts created within the log retention period).
 - **Deleted-account detection (creation-enabled boards only):** if a row's
   status reads "User created" but no matching Moodle account can be
   found, that's treated as a failure rather than silent inaction - the
@@ -166,16 +181,33 @@ offers (a safe standard-field whitelist plus your actual custom fields).
   never triggers a duplicate account, since matching is always checked
   first.
 - **Advanced fields:** a third mapping category, alongside Standard and
-  Custom, for core account properties rather than ordinary profile data -
-  currently `auth` (authentication method), `suspended` (blocks login),
-  and `lastlogin` (read-only for Monday - Moodle overwrites it itself on
-  every real login, so it's restricted to a Moodle → Monday direction
-  only, enforced by the wizard). These genuinely control login access, so
-  they're clearly labelled with a warning in the wizard rather than mixed
-  in unlabelled with ordinary fields. `auth` in particular needs the
+  Custom, for core account properties rather than ordinary profile data.
+  `auth` (authentication method) and `suspended` (blocks login) can be
+  synced in any direction; they genuinely control login access, so they
+  are clearly labelled with a warning in the wizard. `auth` needs the
   Monday column's value to exactly match an enabled auth plugin's
   shortname (e.g. "manual", "nologin") - anything else effectively breaks
-  that account's login.
+  that account's login. `username`, `confirmed`, `policyagreed`,
+  `currentlogin` (shown as **Last login**) and `timecreated` are
+  **Moodle → Monday only**, as are the
+  Standard fields **email** and **ID number**: they show on the board but
+  nothing on Monday can change them in Moodle. (Email decides where
+  password resets go, ID number is the key used to match rows to accounts,
+  username can change which external login resolves to an account, and
+  writing `confirmed` or `policyagreed` would bypass Moodle's own
+  confirmation and policy-acceptance records.) This is enforced on the
+  server, not just by the wizard. A mapping saved before a field was
+  restricted is ignored and reported in the sync log until it is re-saved.
+  **Last login** is Moodle's `currentlogin` - the time of the account's
+  most recent login, whichever sign-in method was used. Moodle's own
+  `lastlogin` field is deliberately not offered: it holds the *previous*
+  login, so it stays 0 after an account's first login and otherwise lags
+  one login behind. It changes when someone logs in, not when they merely
+  stay active in a session they already have open.
+- **Fixed-choice fields are validated before writing.** Country, language
+  and calendar type only accept Moodle's own codes (`GB`, `en`). Moodle
+  itself silently replaces anything else with the site default, so a bad
+  value from Monday is refused and logged instead.
 - **Two-way sync:** each column mapping has a direction, chosen per column
   in the mapping wizard - Monday → Moodle (default), Moodle → Monday, or
   Both ways.
@@ -189,7 +221,13 @@ offers (a safe standard-field whitelist plus your actual custom fields).
 - **Writing to Monday.com:** text and status columns are written using
   their plain display text (e.g. a status label like "Done"), which is
   Monday's own documented approach for simple column writes. Date columns
-  are written using their structured JSON format. Less common column
+  are written using their structured JSON format (UTC date and time), and
+  cleared with an empty string. Last login and Account created can write
+  to a genuine Monday Date column, so Monday's own date filters and
+  automations work on them; whether the cell needs rewriting is decided by
+  comparing Monday's stored UTC value, not its display text, so the
+  timezone of the Monday user makes no difference. No other field can
+  target a Date column. Less common column
   types (formula, mirror, connect boards, etc.) aren't guaranteed to
   accept either format - a failed write shows up as an "error" in the
   sync log with Monday's own error message, rather than failing silently.
@@ -215,3 +253,13 @@ offers (a safe standard-field whitelist plus your actual custom fields).
   thousands of rows on a 15-minute poll; if the board grows large or you
   want near-instant updates later, a webhook-based push model would be a
   better fit for a v2.
+- **Outages and rate limits.** If Monday.com is unavailable for one board,
+  the other boards still sync and retention cleanup still runs; the task is
+  then marked failed so Moodle's own retry backoff applies. Monday's
+  throttling (HTTP 429) is shared by every board on the token, so on a 429
+  the remaining boards are skipped for that run rather than adding to it.
+  The failed and skipped boards are named in the task's failure message.
+- **Privacy.** Personal data held in the sync log, the welcome-email
+  records and the sync cache is exported and erased through Moodle's
+  Privacy API. Erasure deletes the cached values themselves, not just
+  their link to the user.

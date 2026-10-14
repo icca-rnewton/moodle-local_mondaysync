@@ -212,5 +212,96 @@ function xmldb_local_mondaysync_upgrade($oldversion) {
         upgrade_plugin_savepoint(true, 2026072700, 'local', 'mondaysync');
     }
 
+    if ($oldversion < 2026101304) {
+        // External review (item 4): local_mondaysync_manual_email changed
+        // meaning. It started as "this account has been sent its welcome
+        // email"; it is now also the marker for "this account was created
+        // by this plugin", which is what makes an account eligible for
+        // that email at all, and it records the progress of a send so an
+        // interrupted or failed one can be retried a bounded number of
+        // times instead of being stranded.
+        $table = new xmldb_table('local_mondaysync_manual_email');
+
+        $field = new xmldb_field('attempts', XMLDB_TYPE_INTEGER, '10', null, XMLDB_NOTNULL, null, '0', 'timesent');
+        if (!$dbman->field_exists($table, $field)) {
+            $dbman->add_field($table, $field);
+        }
+        $field = new xmldb_field('timeattempted', XMLDB_TYPE_INTEGER, '10', null, XMLDB_NOTNULL, null, '0', 'attempts');
+        if (!$dbman->field_exists($table, $field)) {
+            $dbman->add_field($table, $field);
+        }
+
+        // Accounts this plugin created before that marker existed have no
+        // row, so the new code would treat them as ineligible and never
+        // send them anything. The sync log is the only record of which
+        // accounts the plugin created (an entry with status 'created' and
+        // no field - the tenant assignment also logs 'created', but with a
+        // field). Seed a pending marker for those that are still stranded:
+        // still on manual auth and never used at all - checked across every
+        // login/access column, since Moodle's lastlogin is only the
+        // *previous* login and stays 0 after a first one - so nobody who
+        // is already in has their working password reset. Accounts that
+        // already have a row are left exactly as they are. The log is
+        // subject to its own retention purge, so an account created longer
+        // ago than that can't be identified this way.
+        $sql = "SELECT DISTINCT l.userid
+                  FROM {local_mondaysync_log} l
+                  JOIN {user} u ON u.id = l.userid
+                 WHERE l.status = :created
+                   AND l.field IS NULL
+                   AND u.deleted = 0
+                   AND u.auth = :auth
+                   AND u.firstaccess = 0 AND u.lastaccess = 0
+                   AND u.currentlogin = 0 AND u.lastlogin = 0
+                   AND NOT EXISTS (SELECT 1 FROM {local_mondaysync_manual_email} m WHERE m.userid = u.id)";
+        $userids = $DB->get_fieldset_sql($sql, ['created' => 'created', 'auth' => 'manual']);
+        foreach ($userids as $userid) {
+            $DB->insert_record('local_mondaysync_manual_email', (object) [
+                'userid' => $userid,
+                'timesent' => 0,
+                'attempts' => 0,
+                'timeattempted' => 0,
+            ]);
+        }
+
+        upgrade_plugin_savepoint(true, 2026101304, 'local', 'mondaysync');
+    }
+
+    if ($oldversion < 2026101305) {
+        // The "Last login" field now reads Moodle's currentlogin (the
+        // account's most recent login) instead of lastlogin, which is only
+        // the *previous* login and stays 0 after a first one. The stored
+        // field key changed with it, so carry existing settings across
+        // rather than leaving them pointing at a field that no longer
+        // exists (which would silently stop syncing until re-saved).
+        //
+        // Saved board mappings: lines of "columnid => advanced:lastlogin:...".
+        $boards = $DB->get_records('local_mondaysync_board', null, '', 'id, fieldmappings');
+        foreach ($boards as $board) {
+            $raw = (string) $board->fieldmappings;
+            $updated = preg_replace('/(=>\s*advanced:)lastlogin(?=\s*(?::|$))/m', '${1}currentlogin', $raw);
+            if ($updated !== null && $updated !== $raw) {
+                $DB->set_field('local_mondaysync_board', 'fieldmappings', $updated, ['id' => $board->id]);
+            }
+        }
+
+        // The site-level "fields available for mapping" list. Only touched if
+        // it was ever explicitly saved - otherwise the defaults (which
+        // already name the new field) apply, and a deliberately-disabled
+        // field stays disabled.
+        $enabled = get_config('local_mondaysync', 'enabledfields');
+        if ($enabled !== false && $enabled !== '') {
+            $keys = array_map(function ($key) {
+                return $key === 'adv:lastlogin' ? 'adv:currentlogin' : $key;
+            }, explode(',', $enabled));
+            $new = implode(',', array_unique($keys));
+            if ($new !== $enabled) {
+                set_config('enabledfields', $new, 'local_mondaysync');
+            }
+        }
+
+        upgrade_plugin_savepoint(true, 2026101305, 'local', 'mondaysync');
+    }
+
     return true;
 }

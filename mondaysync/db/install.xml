@@ -71,11 +71,13 @@
         <INDEX NAME="timecreated" UNIQUE="false" FIELDS="timecreated"/>
       </INDEXES>
     </TABLE>
-    <TABLE NAME="local_mondaysync_manual_email" COMMENT="Permanent per-user marker: a row's existence means this account was created by local_mondaysync (seeded at creation time regardless of initial auth), gating whether the manual-auth welcome/password email can ever fire for it. timesent distinguishes eligible-but-not-yet-sent (0) from already-sent (a real timestamp), so it's also never sent twice even if auth flips away from and back to manual.">
+    <TABLE NAME="local_mondaysync_manual_email" COMMENT="Per-user marker: a row's existence means this account was created by local_mondaysync (seeded at creation time regardless of initial auth), gating whether the manual-auth welcome/password email can ever fire for it. timesent: 0 = pending, negative = an attempt began at that time (minus) and has not finished, positive = sent at that time - so it is never sent twice even if auth flips away from and back to manual. attempts/timeattempted bound the automatic retry of an incomplete or failed send.">
       <FIELDS>
         <FIELD NAME="id" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="true"/>
         <FIELD NAME="userid" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false"/>
         <FIELD NAME="timesent" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false"/>
+        <FIELD NAME="attempts" TYPE="int" LENGTH="10" NOTNULL="true" DEFAULT="0" SEQUENCE="false"/>
+        <FIELD NAME="timeattempted" TYPE="int" LENGTH="10" NOTNULL="true" DEFAULT="0" SEQUENCE="false"/>
       </FIELDS>
       <KEYS>
         <KEY NAME="primary" TYPE="primary" FIELDS="id"/>

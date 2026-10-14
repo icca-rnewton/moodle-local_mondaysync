@@ -63,6 +63,32 @@ defined('MOODLE_INTERNAL') || die();
 class sync_manager {
 
     /**
+     * The first Monday.com availability failure swallowed by a best-effort
+     * write during the board currently being processed, if any - see
+     * defer_availability() and run().
+     *
+     * @var api_unavailable_exception|null
+     */
+    protected ?api_unavailable_exception $deferredavailability = null;
+
+    /**
+     * The users whose welcome email is still unfinished, for the board
+     * currently being processed - see load_pending_welcome_users().
+     *
+     * @var array [userid => true]
+     */
+    protected array $pendingwelcome = [];
+
+    /** Most automatic attempts at a welcome email, in all, before it is handed to an admin. */
+    const WELCOME_EMAIL_MAX_ATTEMPTS = 3;
+
+    /** Least time between automatic attempts at the same account's welcome email. */
+    const WELCOME_EMAIL_RETRY_INTERVAL = HOURSECS;
+
+    /** How long an "attempt in progress" marker is trusted before the attempt is presumed dead. */
+    const WELCOME_EMAIL_STALE_AFTER = 10 * MINSECS;
+
+    /**
      * Run one full sync pass across all enabled boards. Safe to call
      * repeatedly (e.g. from the scheduled task).
      */
@@ -84,11 +110,81 @@ class sync_manager {
 
         $client = new monday_client($token, $apiversion);
 
+        // External review, item 3: a Monday.com availability failure used
+        // to escape this loop on the first board that hit one - so later,
+        // possibly perfectly healthy boards never ran, and retention
+        // cleanup never ran either. Each board is now isolated: a failure
+        // is recorded against that board and the others carry on. The one
+        // exception is throttling (HTTP 429), which is shared by every
+        // board on the same token - once that happens, sending the rest
+        // of the boards' requests would only make it worse, so the
+        // remaining boards are skipped and listed as not attempted.
+        //
+        // Cleanup always runs, and only afterwards is one exception
+        // thrown naming what failed - so Moodle still records the task as
+        // failed and applies its own retry backoff, which is the point of
+        // surfacing availability problems at all.
+        global $DB;
+        $failures = [];
+        $notattempted = [];
+        $throttled = false;
+
         foreach ($boards as $board) {
-            $this->run_board($client, $board);
+            if ($throttled) {
+                $notattempted[] = $board->name;
+                continue;
+            }
+
+            $this->deferredavailability = null;
+            $failure = null;
+            try {
+                $this->run_board($client, $board);
+                // A best-effort Monday write inside this board (a status
+                // correction, an error note) can fail with an availability
+                // error without aborting the board - see
+                // defer_availability(). It still counts.
+                $failure = $this->deferredavailability;
+            } catch (api_unavailable_exception $e) {
+                $failure = $e;
+            }
+
+            if ($failure !== null) {
+                $failures[] = '"' . $board->name . '": ' . $failure->getMessage();
+                mtrace('local_mondaysync: board "' . $board->name . '" - Monday.com unavailable: ' . $failure->getMessage());
+                $this->log($DB, $board->id, '(board)', null, null, null, null, 'error',
+                    'Monday.com was unavailable during this board\'s sync, so some or all of it was skipped this run: '
+                    . $failure->getMessage());
+                if ($failure->is_rate_limited()) {
+                    $throttled = true;
+                }
+            }
         }
+        $this->deferredavailability = null;
 
         $this->cleanup_old_data();
+
+        if (!empty($failures)) {
+            $summary = implode('; ', $failures);
+            if (!empty($notattempted)) {
+                $summary .= '. Not attempted, to avoid making the rate limit worse: ' . implode(', ', $notattempted);
+            }
+            throw new api_unavailable_exception('errormondayboardsunavailable', 'local_mondaysync', '', $summary);
+        }
+    }
+
+    /**
+     * Remember that a Monday.com availability failure was seen by a
+     * best-effort write that deliberately doesn't abort what it's part of
+     * (correcting a status, posting an error note) - so the enclosing
+     * flow keeps its own audit logging intact, but run() still fails the
+     * task at the end rather than the outage going unnoticed. Anything
+     * other than an availability failure is ignored here: those are
+     * ordinary per-item problems the caller already logs.
+     */
+    protected function defer_availability(\Throwable $e): void {
+        if ($e instanceof api_unavailable_exception && $this->deferredavailability === null) {
+            $this->deferredavailability = $e;
+        }
     }
 
     /**
@@ -236,9 +332,18 @@ class sync_manager {
 
         mtrace('local_mondaysync: board "' . $board->name . '" - fetched ' . count($items) . ' item(s)');
 
+        $this->pendingwelcome = $this->load_pending_welcome_users($DB, $board);
+
         foreach ($items as $item) {
             try {
                 $this->process_item($DB, $client, $board, $item, $matchingcolumnid, $mappings, $statusindices, $cancreate, $columntypes);
+            } catch (api_unavailable_exception $e) {
+                // External review, item 3: this catch used to swallow an
+                // availability failure as an ordinary per-item error, so an
+                // outage that began mid-board never reached run() (or
+                // Moodle's task backoff) at all. Rethrown instead - run()
+                // isolates it per board.
+                throw $e;
             } catch (\Throwable $e) {
                 // Whatever went wrong with this one item, don't let it take
                 // out every other item on this board (or every other board -
@@ -337,8 +442,15 @@ class sync_manager {
         foreach ($rawmappings as $columnid => $mapping) {
             $moodleok = mapping_util::is_valid_field($mapping['type'], $mapping['field'], $customfields);
             $mondayok = in_array($columnid, $livecolumnids, true);
+            // A saved direction can become disallowed after the fact (a
+            // field later restricted to Moodle -> Monday only). parse()
+            // drops those silently for safety - they're reported here so
+            // it's visible why a mapping stopped doing anything, rather
+            // than just going quiet.
+            $directionok = !$moodleok
+                || mapping_util::is_direction_allowed($mapping['type'], $mapping['field'], $mapping['direction']);
 
-            if ($moodleok && $mondayok) {
+            if ($moodleok && $mondayok && $directionok) {
                 continue;
             }
 
@@ -348,6 +460,10 @@ class sync_manager {
             }
             if (!$moodleok) {
                 $reasons[] = 'Moodle field "' . $mapping['field'] . '" no longer exists';
+            } else if (!$directionok) {
+                $reasons[] = 'Moodle field "' . $mapping['field'] . '" can no longer be synced "' . $mapping['direction']
+                    . '" - it is now ' . implode('/', mapping_util::get_allowed_directions($mapping['type'], $mapping['field']))
+                    . ' only; re-save this mapping in the wizard';
             }
             $problems[] = $columnid . ' (' . implode('; ', $reasons) . ')';
         }
@@ -357,7 +473,7 @@ class sync_manager {
         }
 
         $this->log($DB, $board->id, '(board)', null, null, null, null, 'warning',
-            'Orphaned mapping(s) skipped: ' . implode(', ', $problems) . '. Review this board\'s mapping wizard.');
+            'Mapping(s) skipped: ' . implode(', ', $problems) . '. Review this board\'s mapping wizard.');
     }
 
     /**
@@ -380,8 +496,15 @@ class sync_manager {
         // that explicitly with get_records() rather than get_record(),
         // which would throw dml_multiple_records_exception and abort the
         // rest of this run rather than just skipping the row.
+        // The column list comes from the field catalogue
+        // (mapping_util::get_user_select_fields()), not a separate
+        // hand-written list - an earlier version of this query wasn't
+        // widened when the catalogue grew, so seven fields (email,
+        // country, lang, calendartype, username, confirmed, policyagreed)
+        // read back as blank: toMonday could wipe a Monday value, and
+        // toMoodle saw every unchanged value as different on every poll.
         $rawmatches = $DB->get_records('user', ['idnumber' => $idnumber, 'deleted' => 0], '',
-            'id, idnumber, city, department, institution, address, phone1, phone2, description, firstname, lastname, alternatename, auth, suspended, lastlogin, timecreated');
+            mapping_util::get_user_select_fields());
 
         // Restored (was missing from a stale copy of this file): site
         // administrators and the guest account must never be matched,
@@ -427,6 +550,8 @@ class sync_manager {
             $this->reconcile_creation_status($DB, $client, $board, $itemid, $item, $statusindices);
         }
 
+        $this->recover_welcome_email($DB, $client, $board, $itemid, $user);
+
         foreach ($mappings as $columnid => $mapping) {
             if ($columnid === $matchingcolumnid) {
                 continue;
@@ -437,6 +562,11 @@ class sync_manager {
 
             try {
                 $this->process_mapping($DB, $client, $board, $itemid, $user, $columnid, $mapping, $item, $columntypes[$columnid] ?? '');
+            } catch (api_unavailable_exception $e) {
+                // Same reasoning as the item loop in run_board(): a
+                // Monday write failing because Monday is unavailable is
+                // not a problem with this one mapping.
+                throw $e;
             } catch (\Throwable $e) {
                 $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], null, null, 'error', $e->getMessage());
             }
@@ -488,6 +618,7 @@ class sync_manager {
             $this->log($DB, $board->id, $itemid, null, null, $current, mapping_util::STATUS_CREATED, 'corrected',
                 'An account already exists for this row - corrected the creation-status column back to "' . mapping_util::STATUS_CREATED . '".');
         } catch (\Throwable $e) {
+            $this->defer_availability($e);
             mtrace('local_mondaysync: board "' . $board->name . '" - failed to correct creation status for item ' . $itemid . ': ' . $e->getMessage());
         }
     }
@@ -628,6 +759,12 @@ class sync_manager {
             try {
                 $client->set_column_value_json($board->boardid, $itemid, $triggercolumnid, ['index' => $statusindices['created']]);
             } catch (\Throwable $e) {
+                // Deferred rather than rethrown: rethrowing here would skip
+                // the 'created' audit entry just below for an account that
+                // genuinely was created. run() still fails the task at the
+                // end if this was an availability failure, and the next run
+                // corrects the status via reconcile_creation_status().
+                $this->defer_availability($e);
                 mtrace('local_mondaysync: created user ' . $newuserid . ' but failed to update the status column: ' . $e->getMessage());
             }
         }
@@ -758,7 +895,10 @@ class sync_manager {
             try {
                 $client->set_column_value_json($board->boardid, $itemid, $triggercolumnid, ['index' => $statusindices['error']]);
             } catch (\Throwable $e) {
-                // Swallow - the log entry below is what actually matters here.
+                // Not rethrown - the log entry below is what actually
+                // matters here - but an availability failure is still
+                // remembered so the task fails at the end of the run.
+                $this->defer_availability($e);
             }
         }
 
@@ -766,7 +906,10 @@ class sync_manager {
             $client->create_update($itemid, 'Moodle account creation failed: ' . htmlspecialchars($reason, ENT_QUOTES));
         } catch (\Throwable $e) {
             // Best-effort - the Moodle log entry below is the reliable
-            // record either way, this is just a convenience for Ops.
+            // record either way, this is just a convenience for Ops. An
+            // availability failure is still remembered (see
+            // defer_availability()) so the task fails at the end of the run.
+            $this->defer_availability($e);
             mtrace('local_mondaysync: failed to post error update to item ' . $itemid . ': ' . $e->getMessage());
         }
 
@@ -865,25 +1008,22 @@ class sync_manager {
             }
         }
 
-        if ($mapping['type'] === 'advanced' && $mapping['field'] === 'username'
+        if ($mapping['type'] === 'standard' && in_array($mapping['field'], mapping_util::FIXED_CHOICE_FIELDS, true)
             && $mondayvalue !== '' && in_array($direction, ['toMoodle', 'both'], true)) {
-            // user_update_user() validates username *format* (must be
-            // lowercase, "clean" per PARAM_USERNAME-style rules) but
-            // never checks *uniqueness* against other accounts (confirmed
-            // against core source) - without this guard, a sync could
-            // silently give two different accounts the same username, a
-            // broken, ambiguous state for login. mnethostid-scoped, same
-            // as how Moodle itself treats username uniqueness (unique per
-            // mnet host, not globally).
-            global $CFG;
-            $existing = $DB->get_record('user', [
-                'username' => $mondayvalue,
-                'mnethostid' => $CFG->mnet_localhost_id,
-                'deleted' => 0,
-            ]);
-            if ($existing && (int)$existing->id !== (int)$user->id) {
+            // Country, language and calendar type only accept a fixed set
+            // of values. Moodle doesn't reject a bad one: user_update_user()
+            // silently swaps it for the site's default (core_user::
+            // clean_field, with only a developer-level debug message), so
+            // a Monday cell holding "United Kingdom" instead of the code
+            // "GB" would change the account to the site default country
+            // while this log still reported the Monday value as written -
+            // and, since Moodle then holds a different value from Monday,
+            // look "changed" again on every following poll. Checked here
+            // with core's own validation so a bad value is refused and
+            // logged accurately instead.
+            if (!mapping_util::is_fixed_choice_value_valid($mapping['field'], $mondayvalue)) {
                 $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], null, $mondayvalue, 'error',
-                    '"' . $mondayvalue . '" is already the username of a different Moodle account (user id ' . $existing->id . ') - value left unchanged to avoid creating a duplicate username.');
+                    '"' . $mondayvalue . '" is not a valid value for this field - Moodle expects its own code (for example "GB" for country, "en" for language) - value left unchanged.');
                 return;
             }
         }
@@ -936,11 +1076,31 @@ class sync_manager {
         }
 
         if ($direction === 'toMonday') {
-            if ($moodlevalue !== $mondayvalue) {
-                $rawtimestamp = null;
-                if ($mapping['type'] === 'advanced' && in_array($mapping['field'], ['lastlogin', 'timecreated'], true)) {
-                    $rawtimestamp = (int)($user->{$mapping['field']} ?? 0);
+            $rawtimestamp = null;
+            $changed = ($moodlevalue !== $mondayvalue);
+
+            if (mapping_util::is_timestamp_field($mapping['type'], $mapping['field'])) {
+                $rawtimestamp = (int)($user->{$mapping['field']} ?? 0);
+
+                if ($mondaycolumntype === 'date') {
+                    // A genuine Date column holds a real date, not text, so
+                    // comparing Moodle's human-readable string ("Never
+                    // logged in", or a local "Y-m-d H:i") against the
+                    // column's display text was never reliable: a cleared
+                    // cell reads back as "" and so never equalled "Never
+                    // logged in" - re-clearing it, and logging "updated",
+                    // on every poll - and a real date only matched while
+                    // Moodle and the Monday user happened to share a
+                    // timezone. Compare what Monday actually stores (its
+                    // raw UTC value) against the time this would write.
+                    $changed = $this->monday_date_differs_from_timestamp(
+                        $rawtimestamp,
+                        $item['columns'][$columnid]['value'] ?? null
+                    );
                 }
+            }
+
+            if ($changed) {
                 $this->apply_to_monday($client, $board, $itemid, $columnid, $mapping, $moodlevalue, $mondaycolumntype, $rawtimestamp);
                 $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], $mondayvalue, $moodlevalue, 'updated', null);
             }
@@ -1009,7 +1169,7 @@ class sync_manager {
         }
 
         // Only Moodle changed. Raw timestamp is always null here - a
-        // 'both'-direction mapping can never be lastlogin/timecreated
+        // 'both'-direction mapping can never be currentlogin/timecreated
         // (both are restricted to toMonday-only), so there's nothing for
         // it to apply to on this path.
         $this->apply_to_monday($client, $board, $itemid, $columnid, $mapping, $moodlevalue, $mondaycolumntype, null);
@@ -1045,18 +1205,24 @@ class sync_manager {
         }
 
         if ($mapping['type'] === 'advanced') {
-            if ($mapping['field'] === 'lastlogin') {
-                // lastlogin is toMonday-only (Moodle overwrites it itself
-                // on every real login, so it's never written back to
-                // Moodle) - format it for a human reading the board,
-                // rather than pushing a raw Unix timestamp.
-                $timestamp = (int)($user->lastlogin ?? 0);
+            if ($mapping['field'] === 'currentlogin') {
+                // The time of the account's most recent login, shown to
+                // Ops as "Last login". Moodle's own lastlogin column is
+                // deliberately not used: it is the *previous* login
+                // (Moodle copies the old currentlogin into it on every
+                // login), so it is still 0 after a first login and
+                // otherwise lags a login behind. toMonday-only - Moodle
+                // overwrites this itself on every real login, so it's
+                // never written back to Moodle. Formatted for a human
+                // reading the board, rather than pushing a raw Unix
+                // timestamp; 0 means the account has never logged in.
+                $timestamp = (int)($user->currentlogin ?? 0);
                 return $timestamp > 0 ? date('Y-m-d H:i', $timestamp) : get_string('neverloggedin', 'local_mondaysync');
             }
             if ($mapping['field'] === 'timecreated') {
-                // Also toMonday-only, same reasoning as lastlogin - this
+                // Also toMonday-only, same reasoning as currentlogin - this
                 // is always set for a genuinely existing account (unlike
-                // lastlogin, which can be 0 for "never logged in"), so no
+                // currentlogin, which is 0 for "never logged in"), so no
                 // fallback string is needed.
                 $timestamp = (int)($user->timecreated ?? 0);
                 return $timestamp > 0 ? date('Y-m-d H:i', $timestamp) : '';
@@ -1139,40 +1305,68 @@ class sync_manager {
     }
 
     /**
+     * Where a welcome email stands, given its marker row:
+     *
+     * - 'sent'      - delivered; never sent again.
+     * - 'running'   - an attempt began a few minutes ago and may still be
+     *                 in flight; leave it alone.
+     * - 'exhausted' - the automatic attempts have been used up; it is now
+     *                 an admin's job (see give_up_on_welcome_email()).
+     * - 'wait'      - tried recently; not due again yet.
+     * - 'due'       - ready to be attempted.
+     *
+     * timesent is 0 while pending, negative (minus the start time) while
+     * an attempt is in progress, and a real timestamp once sent. Kept as a
+     * plain function of the row and the current time so every path that
+     * can send a welcome email asks the same question.
+     */
+    protected function welcome_email_status(\stdClass $record, int $now): string {
+        $timesent = (int) $record->timesent;
+
+        if ($timesent > 0) {
+            return 'sent';
+        }
+        if ($timesent < 0 && ($now - abs($timesent)) < self::WELCOME_EMAIL_STALE_AFTER) {
+            return 'running';
+        }
+        if ((int) $record->attempts >= self::WELCOME_EMAIL_MAX_ATTEMPTS) {
+            return 'exhausted';
+        }
+        if ((int) $record->attempts > 0 && ($now - (int) $record->timeattempted) < self::WELCOME_EMAIL_RETRY_INTERVAL) {
+            return 'wait';
+        }
+        return 'due';
+    }
+
+    /**
      * Send the "here's your new password" welcome email for a manual-auth
-     * account - but only ever once per account, regardless of how many
-     * times its auth method flips away from and back to "manual" (e.g.
-     * created as nologin, later switched to manual once Ops are ready).
-     * Tracked in a dedicated table rather than the sync log, since the
-     * log is subject to the retention-period purge and this needs to be
-     * permanent for as long as the account exists.
+     * account, tracking it so it neither goes out twice nor gets stranded.
      *
-     * 2026 fix (external review, item 4 / previously fixed and lost): a
-     * row's mere *existence* means "this account was created by this
-     * plugin" (seeded at creation time in process_user_creation(),
-     * regardless of the account's initial auth), not "already emailed".
-     * timesent distinguishes three states, all in one column (no schema
-     * change needed): 0 = eligible, not yet attempted; negative = an
-     * attempt started at abs(timesent) and never resolved (crash-safety,
-     * see below); positive = genuinely sent at this timestamp. Previously
-     * there was no check at all for whether an account had been created
-     * by this plugin - any existing account (a real person's real,
-     * already-in-use account) whose auth was mapped to "manual" for any
-     * reason would silently have its password regenerated and emailed.
+     * Only ever acts on an account this plugin created: a row in
+     * local_mondaysync_manual_email is the marker for that (seeded at
+     * creation, or by the upgrade for older accounts), and an account
+     * without one is never touched. The row's timesent/attempts/
+     * timeattempted say how far along the send is - see
+     * welcome_email_status().
      *
-     * Moodle's own setnew_password_and_mail() resets the password BEFORE
-     * attempting delivery - if delivery fails, the account already has a
-     * new password nobody was told. That ordering lives inside core and
-     * isn't something this plugin controls without reimplementing the
-     * reset itself, so rather than fight it, two things are done well
-     * instead: (1) the negative-timestamp marker is written *before*
-     * calling it, so a process interrupted mid-call is safely detected
-     * and retried next run rather than silently leaving the row looking
-     * like "never attempted" or (if the crash happened right after a
-     * successful send) double-sent; (2) a failed send posts a Monday
-     * update explaining the account needs a manual password reset,
-     * making the stranded state visible where Ops will actually see it,
-     * not just an entry in Moodle's own log.
+     * Moodle's setnew_password_and_mail() resets the password BEFORE it
+     * tries to send, and that ordering lives in core. So an attempt that
+     * dies part-way - or whose email fails - leaves the account with a
+     * password nobody has been told. External review, item 4: nothing used
+     * to revisit that, because the normal triggers (account creation, or
+     * the auth value changing to manual) only fire once. Two things
+     * address it:
+     *
+     * - The "attempt in progress" marker (negative timesent, plus the
+     *   attempt count) is written BEFORE calling into core, so a crash is
+     *   visible afterwards and not mistaken for "never tried".
+     * - recover_welcome_email() re-offers every unfinished attempt on
+     *   later syncs, through this same function, so an interrupted or
+     *   failed send is retried - at most WELCOME_EMAIL_MAX_ATTEMPTS times
+     *   in all, no more often than WELCOME_EMAIL_RETRY_INTERVAL apart. If
+     *   that runs out, give_up_on_welcome_email() makes sure a person is
+     *   told on the Monday row and in the log, so the account is never
+     *   left with a reset password and nobody aware of it.
      */
     protected function send_manual_password_email_once(\moodle_database $DB, monday_client $client, \stdClass $board, string $itemid, int $userid): void {
         $record = $DB->get_record('local_mondaysync_manual_email', ['userid' => $userid]);
@@ -1183,27 +1377,28 @@ class sync_manager {
             return;
         }
 
-        $timesent = (int) $record->timesent;
+        $now = time();
+        $status = $this->welcome_email_status($record, $now);
 
-        if ($timesent > 0) {
-            return; // Already sent successfully.
+        if ($status === 'exhausted' && (int) $record->timesent < 0) {
+            // An attempt began, never finished, and there are no attempts
+            // left. Settle the marker so this is reported exactly once,
+            // and hand it to a person.
+            $record->timesent = 0;
+            $DB->update_record('local_mondaysync_manual_email', $record);
+            $this->give_up_on_welcome_email($DB, $client, $board, $itemid, $userid, (int) $record->attempts);
+            return;
         }
 
-        if ($timesent < 0) {
-            // A previous attempt started but never resolved - either
-            // still genuinely in flight (implausible; a single email
-            // send resolves in seconds, not minutes) or the process was
-            // interrupted mid-attempt. Only safe to retry once enough
-            // time has passed that "still in flight" isn't realistic.
-            if ((time() - abs($timesent)) < 10 * MINSECS) {
-                return;
-            }
+        if ($status !== 'due') {
+            return;
         }
 
-        // Mark "attempt in progress" before calling into core, so a
-        // crash during the send itself is detected and retried next run
-        // rather than the row staying stuck looking untried forever.
-        $record->timesent = -time();
+        // Record the attempt BEFORE calling into core, so one that dies
+        // part-way is visible (and counted) rather than looking untried.
+        $record->attempts = (int) $record->attempts + 1;
+        $record->timeattempted = $now;
+        $record->timesent = -$now;
         $DB->update_record('local_mondaysync_manual_email', $record);
 
         global $CFG;
@@ -1213,8 +1408,11 @@ class sync_manager {
             $user = $DB->get_record('user', ['id' => $userid], '*', MUST_EXIST);
             $sent = setnew_password_and_mail($user);
         } catch (\Throwable $e) {
+            // Left marked in-progress on purpose: once the staleness window
+            // passes it is retried, and the attempt already counted.
             $this->log($DB, $board->id, $itemid, $userid, 'auth', null, null, 'error',
-                'Could not send the manual-auth welcome email: ' . $e->getMessage());
+                'Could not send the manual-auth welcome email (attempt ' . $record->attempts . ' of '
+                . self::WELCOME_EMAIL_MAX_ATTEMPTS . '): ' . $e->getMessage());
             return;
         }
 
@@ -1224,30 +1422,106 @@ class sync_manager {
             $DB->update_record('local_mondaysync_manual_email', $record);
             $this->log($DB, $board->id, $itemid, $userid, 'auth', null, null, 'emailed',
                 'Sent the new-password welcome email for this manual-auth account (a password change will be required at next login).');
-        } else {
-            // setnew_password_and_mail() returns false rather than
-            // throwing when the mail server rejects it. The password has
-            // already been reset by this point (core's own behaviour,
-            // not something reorderable from here) - back to "eligible"
-            // so a genuine future transition back into "manual" retries
-            // it, and post an update directly on the Monday item so this
-            // doesn't sit invisible in Moodle's log while a real person
-            // can't log in.
-            $record->timesent = 0;
-            $DB->update_record('local_mondaysync_manual_email', $record);
-            try {
-                $client->create_update($itemid, 'This account\'s password was reset for the manual-auth welcome email, '
-                    . 'but the email itself failed to send (check the server\'s mail logs). The account currently has a '
-                    . 'password nobody has been told - a site admin should manually trigger a password reset for this '
-                    . 'user via Site administration, or set them to a different auth method.');
-            } catch (\Throwable $e) {
-                mtrace('local_mondaysync: failed to post welcome-email-failure update to item ' . $itemid . ': ' . $e->getMessage());
-            }
-            $this->log($DB, $board->id, $itemid, $userid, 'auth', null, null, 'error',
-                'Password was reset for the welcome email, but sending it failed (check the server\'s mail logs) - '
-                . 'the account currently has a password nobody has been told. Will retry automatically only if auth '
-                . 'changes away from and back to manual; a Monday update was also posted on this item.');
+            return;
         }
+
+        // setnew_password_and_mail() returns false rather than throwing
+        // when the mail server rejects it. The password has already been
+        // reset by this point (core's own behaviour, not reorderable from
+        // here), so back to pending - retried automatically, within limits.
+        $record->timesent = 0;
+        $DB->update_record('local_mondaysync_manual_email', $record);
+
+        if ((int) $record->attempts >= self::WELCOME_EMAIL_MAX_ATTEMPTS) {
+            $this->give_up_on_welcome_email($DB, $client, $board, $itemid, $userid, (int) $record->attempts);
+            return;
+        }
+
+        $this->log($DB, $board->id, $itemid, $userid, 'auth', null, null, 'error',
+            'Password was reset for the welcome email, but sending it failed (check the server\'s mail logs) - attempt '
+            . $record->attempts . ' of ' . self::WELCOME_EMAIL_MAX_ATTEMPTS . '. It will be retried automatically '
+            . 'on a later sync, no sooner than an hour from now.');
+    }
+
+    /**
+     * Stop retrying a welcome email and make sure a person knows - on the
+     * Monday item, where Ops will see it, and in the log. Reached once
+     * the automatic attempts are used up without the email being delivered
+     * (whether the last one failed or was interrupted), at which point the
+     * account holds a reset password that nobody has been told.
+     */
+    protected function give_up_on_welcome_email(\moodle_database $DB, monday_client $client, \stdClass $board, string $itemid, int $userid, int $attempts): void {
+        try {
+            $client->create_update($itemid, 'This account\'s password was reset so its welcome email could be sent, but the email '
+                . 'could not be delivered after ' . $attempts . ' attempts (check the server\'s mail logs). The account currently '
+                . 'has a password nobody has been told - a site admin should trigger a password reset for this user via Site '
+                . 'administration, or set them to a different auth method. No further automatic attempts will be made.');
+        } catch (\Throwable $e) {
+            // Advisory note only - deferred, not rethrown, so the audit
+            // entry below is still written (see defer_availability()).
+            $this->defer_availability($e);
+            mtrace('local_mondaysync: failed to post welcome-email note to item ' . $itemid . ': ' . $e->getMessage());
+        }
+
+        $this->log($DB, $board->id, $itemid, $userid, 'auth', null, null, 'error',
+            'Gave up on the welcome email after ' . $attempts . ' attempts - the account has a reset password that nobody has '
+            . 'been told. A site admin needs to trigger a password reset for this user, or change their auth method. '
+            . 'A note was posted on this Monday item.');
+    }
+
+    /**
+     * Re-offer an unfinished welcome email for a matched account - one an
+     * attempt began for and never completed, or that failed. Without this
+     * nothing ever revisited them (external review, item 4): the normal
+     * triggers fire once, at account creation or when the auth value
+     * changes to manual, and by then the account is already on manual.
+     *
+     * Deliberately narrow. Only for an account the plugin created that is
+     * still pending (the marker row; $this->pendingwelcome, loaded once per
+     * board), on manual auth, not suspended, and never used at all -
+     * judged across every login/access column, since Moodle's lastlogin is
+     * only the previous login and stays 0 after a first one. Anyone who
+     * has already been in has a working password, which resetting would
+     * break. Whether and when a send actually goes ahead, and how many
+     * times, is decided by send_manual_password_email_once().
+     */
+    protected function recover_welcome_email(\moodle_database $DB, monday_client $client, \stdClass $board, string $itemid, \stdClass $user): void {
+        if (empty($board->createemailpassword)) {
+            return;
+        }
+        if (!isset($this->pendingwelcome[(int) $user->id])) {
+            return;
+        }
+        if (($user->auth ?? '') !== 'manual' || !empty($user->suspended)) {
+            return;
+        }
+        if (!empty($user->firstaccess) || !empty($user->lastaccess) || !empty($user->currentlogin) || !empty($user->lastlogin)) {
+            return;
+        }
+
+        $this->send_manual_password_email_once($DB, $client, $board, $itemid, (int) $user->id);
+    }
+
+    /**
+     * The users with a welcome email still unfinished, for a board that
+     * has sending turned on - loaded once per board run rather than a
+     * lookup per matched user. Includes in-progress markers whatever their
+     * attempt count, since an exhausted-but-interrupted one still needs
+     * settling and reporting once; pending ones only while attempts remain.
+     *
+     * @return array [userid => true]
+     */
+    protected function load_pending_welcome_users(\moodle_database $DB, \stdClass $board): array {
+        if (empty($board->createemailpassword)) {
+            return [];
+        }
+        $ids = $DB->get_fieldset_select(
+            'local_mondaysync_manual_email',
+            'userid',
+            'timesent < 0 OR (timesent = 0 AND attempts < :maxattempts)',
+            ['maxattempts' => self::WELCOME_EMAIL_MAX_ATTEMPTS]
+        );
+        return array_fill_keys(array_map('intval', $ids), true);
     }
 
     /**
@@ -1262,6 +1536,8 @@ class sync_manager {
         $record = new \stdClass();
         $record->userid = $userid;
         $record->timesent = 0;
+        $record->attempts = 0;
+        $record->timeattempted = 0;
         $DB->insert_record('local_mondaysync_manual_email', $record);
     }
 
@@ -1357,15 +1633,14 @@ class sync_manager {
             } else {
                 $client->set_column_value_json($board->boardid, $itemid, $columnid, ['date' => $newvalue]);
             }
-        } else if ($mapping['type'] === 'advanced' && in_array($mapping['field'], ['lastlogin', 'timecreated'], true)
-            && $mondaycolumntype === 'date') {
-            // 2026 addition: lastlogin/timecreated can now write to a
+        } else if (mapping_util::is_timestamp_field($mapping['type'], $mapping['field']) && $mondaycolumntype === 'date') {
+            // 2026 addition: currentlogin/timecreated can now write to a
             // genuine Monday "Date" column, not just Text/Status - lets
             // Ops use Monday's own native date filtering/automations
             // against this value (e.g. "if last login is before X, do
             // Y"), which a plain text column can't support. Uses the same
             // structured JSON mechanism as the 'date' mapping type above,
-            // with both date and time keys (lastlogin/timecreated carry a
+            // with both date and time keys (currentlogin/timecreated carry a
             // meaningful time-of-day, unlike a plain date-only field),
             // explicitly in UTC per Monday's own documented format for
             // this column - gmdate() rather than date(), regardless of
@@ -1376,7 +1651,7 @@ class sync_manager {
             // string through the simple mutation, same fix as the 'date'
             // type above, not the JSON mutation with an empty array.
             // Validation only allows this combination for
-            // lastlogin/timecreated specifically - every other advanced/
+            // currentlogin/timecreated specifically - every other advanced/
             // standard/custom field still can't target a genuine Date
             // column at all, since nothing else here represents a
             // timestamp.
@@ -1406,6 +1681,38 @@ class sync_manager {
             // rather than attempted here for every possible column type.
             $client->set_simple_column_value($board->boardid, $itemid, $columnid, $newvalue);
         }
+    }
+
+    /**
+     * Whether a Monday Date column's current contents differ from the
+     * moment a Moodle timestamp represents - used for currentlogin and
+     * timecreated, which are written to a Date column as a UTC date and
+     * time (see apply_to_monday()).
+     *
+     * Compares Monday's raw column value (always UTC) rather than its
+     * display text, which is formatted in the Monday user's own timezone,
+     * and to the minute rather than the second, in case Monday stores
+     * less precision than was written. A zero timestamp ("never logged
+     * in") means the cell should be empty, so an empty cell is "no
+     * difference" and anything else is.
+     *
+     * @param int $timestamp Moodle's value; 0 means "none".
+     * @param string|null $mondayvalue The column's raw JSON value as Monday returned it, or null if empty.
+     */
+    protected function monday_date_differs_from_timestamp(int $timestamp, ?string $mondayvalue): bool {
+        $current = null;
+        if ($mondayvalue !== null && $mondayvalue !== '') {
+            $decoded = json_decode($mondayvalue, true);
+            if (is_array($decoded) && !empty($decoded['date'])) {
+                $time = !empty($decoded['time']) ? $decoded['time'] : '00:00:00';
+                $parsed = strtotime($decoded['date'] . ' ' . $time . ' UTC');
+                $current = ($parsed === false) ? null : intdiv($parsed, 60);
+            }
+        }
+
+        $wanted = $timestamp > 0 ? intdiv($timestamp, 60) : null;
+
+        return $current !== $wanted;
     }
 
     /**

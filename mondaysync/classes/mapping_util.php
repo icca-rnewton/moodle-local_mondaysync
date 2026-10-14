@@ -64,19 +64,70 @@ class mapping_util {
     ];
 
     /**
+     * Standard fields restricted to a narrower set of directions than the
+     * three general ones. Anything not listed here can be used in all
+     * three directions.
+     *
+     * email and idnumber are Moodle -> Monday only (external review,
+     * item 1): email controls where Moodle sends password-reset links, so
+     * letting a Monday edit replace an existing account's address would
+     * let whoever controls that cell redirect the account; idnumber is
+     * the value this plugin uses to match a Monday row to a Moodle
+     * account in the first place, so letting the sync rewrite it can
+     * destabilise every later match. Both stay available as an export so
+     * Ops can see them on the board, but nothing on Monday can change
+     * them in Moodle.
+     *
+     * @var array [fieldname => string[] of allowed directions]
+     */
+    const STANDARD_FIELD_DIRECTIONS = [
+        'email' => ['toMonday'],
+        'idnumber' => ['toMonday'],
+    ];
+
+    /**
+     * Standard fields whose value must be one of a fixed set of choices
+     * (country code, language pack, calendar type). Moodle silently
+     * replaces an invalid value for these with the site default rather
+     * than rejecting it (core_user::clean_field), so they're checked
+     * before writing - see is_fixed_choice_value_valid().
+     *
+     * @var string[]
+     */
+    const FIXED_CHOICE_FIELDS = ['country', 'lang', 'calendartype'];
+
+    /**
      * Advanced (core account-property) fields, each with the set of
-     * directions it's actually allowed to be used in. auth/suspended/
-     * username/confirmed/policyagreed genuinely control login access or
-     * account state directly, not ordinary profile data - an admin
-     * choosing to expose these is expected to understand that risk (the
-     * wizard labels them clearly, and the site-level field picker keeps
-     * them off by default, same as the newer standard fields).
-     * lastlogin/timecreated are restricted to toMonday only for a
-     * technical reason rather than a risk one: Moodle overwrites both
-     * itself (on every real login, and once at account creation
-     * respectively), so a write into either from Monday would just get
-     * silently clobbered - there's no point offering a direction that can
-     * never actually take effect.
+     * directions it's actually allowed to be used in.
+     *
+     * auth and suspended are the only ones that can be written from
+     * Monday - they control login access directly, so an admin choosing
+     * to expose them is expected to understand that risk (the wizard
+     * labels them clearly, and the site-level field picker can switch
+     * them off).
+     *
+     * username, confirmed and policyagreed are Moodle -> Monday only
+     * (external review, item 1) - not ordinary profile data: changing
+     * username can change which external identity resolves to an
+     * account; writing confirmed can bypass or reverse Moodle's email
+     * confirmation; writing policyagreed flips Moodle's flag without
+     * creating the underlying policy-acceptance record. Visible on the
+     * board, never changeable from it.
+     *
+     * currentlogin/timecreated are Moodle -> Monday only for a technical
+     * reason rather than a risk one: Moodle overwrites both itself (on
+     * every real login, and once at account creation respectively), so a
+     * write into either from Monday would just get silently clobbered -
+     * there's no point offering a direction that can never actually take
+     * effect.
+     *
+     * currentlogin is the single "Last login" field (labelled that way
+     * for Ops): the time of the account's most recent login. Moodle's own
+     * lastlogin column is deliberately not offered - it holds the
+     * *previous* login (on every login Moodle copies the old currentlogin
+     * into it), so it is still 0 after an account's first login and
+     * otherwise lags one login behind. Offering both would only invite
+     * choosing the wrong one.
      *
      * Like SAFE_STANDARD_FIELDS, this is the full catalog this plugin
      * knows about, not necessarily what's currently offered - see
@@ -87,12 +138,37 @@ class mapping_util {
     const ADVANCED_FIELDS = [
         'auth' => ['toMoodle', 'toMonday', 'both'],
         'suspended' => ['toMoodle', 'toMonday', 'both'],
-        'username' => ['toMoodle', 'toMonday', 'both'],
-        'confirmed' => ['toMoodle', 'toMonday', 'both'],
-        'policyagreed' => ['toMoodle', 'toMonday', 'both'],
-        'lastlogin' => ['toMonday'],
+        'username' => ['toMonday'],
+        'confirmed' => ['toMonday'],
+        'policyagreed' => ['toMonday'],
+        'currentlogin' => ['toMonday'],
         'timecreated' => ['toMonday'],
     ];
+
+    /**
+     * The Advanced fields that hold a Unix timestamp and are written to
+     * Monday as a date (and, for a genuine Monday Date column, as a UTC
+     * date and time). One list, used by the sync engine and the wizard
+     * alike - these were previously spelled out separately in several
+     * places, which is how the lists drift apart.
+     *
+     * @var string[]
+     */
+    const TIMESTAMP_FIELDS = ['currentlogin', 'timecreated'];
+
+    /**
+     * User columns the sync engine itself needs but that are not mappable
+     * fields: used to tell whether an account has ever been used at all
+     * (see sync_manager::recover_welcome_email()). Moodle's lastlogin is
+     * only the previous login - it stays 0 after a first one - so "never
+     * used" is judged from all of these together. lastlogin is no longer
+     * a mappable field but is still loaded here for that check, and
+     * currentlogin is listed even though it is also in the catalogue so
+     * the check doesn't silently depend on that staying so.
+     *
+     * @var string[]
+     */
+    const INTERNAL_USER_FIELDS = ['firstaccess', 'lastaccess', 'lastlogin', 'currentlogin'];
 
     /** @var string[] Valid sync directions. */
     const DIRECTIONS = ['toMoodle', 'toMonday', 'both'];
@@ -126,7 +202,7 @@ class mapping_util {
      *
      * @var string[]
      */
-    const DEFAULT_ENABLED_ADVANCED_FIELDS = ['auth', 'suspended', 'lastlogin', 'timecreated'];
+    const DEFAULT_ENABLED_ADVANCED_FIELDS = ['auth', 'suspended', 'currentlogin', 'timecreated'];
 
     /**
      * Canonical text this plugin writes to a board's creation-trigger Status
@@ -249,15 +325,127 @@ class mapping_util {
     }
 
     /**
-     * Whether a direction is allowed for a given type/field. Only
-     * 'advanced' fields can have a restricted set (see ADVANCED_FIELDS);
-     * everything else just needs to be one of the three general directions.
+     * The directions a given type/field may be used in. Standard fields
+     * can be restricted (STANDARD_FIELD_DIRECTIONS) and so can Advanced
+     * ones (ADVANCED_FIELDS); everything else (custom and date profile
+     * fields) is unrestricted.
+     *
+     * This and get_forced_direction() are the one place that answers
+     * "which directions does this field allow" - the wizard validation,
+     * the direction-lock script, the save step in mapping.php and the
+     * sync engine all ask here rather than each keeping their own idea
+     * of it.
+     *
+     * @return string[]
+     */
+    public static function get_allowed_directions(string $type, string $field): array {
+        if ($type === 'standard' && array_key_exists($field, self::STANDARD_FIELD_DIRECTIONS)) {
+            return self::STANDARD_FIELD_DIRECTIONS[$field];
+        }
+        if ($type === 'advanced' && array_key_exists($field, self::ADVANCED_FIELDS)) {
+            return self::ADVANCED_FIELDS[$field];
+        }
+        return self::DIRECTIONS;
+    }
+
+    /**
+     * Whether a type/field is an Advanced field holding a Unix timestamp
+     * (see TIMESTAMP_FIELDS).
+     */
+    public static function is_timestamp_field(string $type, string $field): bool {
+        return $type === 'advanced' && in_array($field, self::TIMESTAMP_FIELDS, true);
+    }
+
+    /**
+     * Whether a direction is allowed for a given type/field.
      */
     public static function is_direction_allowed(string $type, string $field, string $direction): bool {
-        if ($type === 'advanced' && array_key_exists($field, self::ADVANCED_FIELDS)) {
-            return in_array($direction, self::ADVANCED_FIELDS[$field], true);
+        return in_array($direction, self::get_allowed_directions($type, $field), true);
+    }
+
+    /**
+     * The one direction a field is locked to, or null if it can be used in
+     * more than one. The server uses this to decide the direction for a
+     * locked field regardless of what the browser posts - a disabled
+     * <select> doesn't submit at all.
+     */
+    public static function get_forced_direction(string $type, string $field): ?string {
+        $allowed = self::get_allowed_directions($type, $field);
+        return count($allowed) === 1 ? reset($allowed) : null;
+    }
+
+    /**
+     * Every locked field and its forced direction, keyed 'type:field' -
+     * the same value format the mapping wizard's dropdown uses - for the
+     * direction-lock script.
+     *
+     * @return array ['standard:email' => 'toMonday', ...]
+     */
+    public static function get_forced_directions(): array {
+        $out = [];
+        foreach (array_keys(self::STANDARD_FIELD_DIRECTIONS) as $field) {
+            $forced = self::get_forced_direction('standard', $field);
+            if ($forced !== null) {
+                $out['standard:' . $field] = $forced;
+            }
         }
-        return in_array($direction, self::DIRECTIONS, true);
+        foreach (array_keys(self::ADVANCED_FIELDS) as $field) {
+            $forced = self::get_forced_direction('advanced', $field);
+            if ($forced !== null) {
+                $out['advanced:' . $field] = $forced;
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * A short " (Moodle -> Monday only)" style note for a field label, or
+     * an empty string if the field isn't restricted - so a locked field
+     * says so in the dropdown and the admin picker, not just after it's
+     * been selected.
+     */
+    public static function restriction_suffix(string $type, string $field): string {
+        $allowed = self::get_allowed_directions($type, $field);
+        if (count($allowed) >= count(self::DIRECTIONS)) {
+            return '';
+        }
+        $names = array_map(function ($d) {
+            return get_string('direction' . strtolower($d), 'local_mondaysync');
+        }, $allowed);
+        return ' (' . implode(', ', $names) . ' ' . get_string('only', 'local_mondaysync') . ')';
+    }
+
+    /**
+     * The column list for loading a matched Moodle user, built from the
+     * field catalogue (external review, item 1) - previously a separate
+     * hand-written list that wasn't widened when the catalogue grew, so
+     * seven newly-added fields read back as blank and were treated as
+     * changed on every poll. Anything in the catalogue is loaded; id and
+     * idnumber are always loaded since the matching itself needs them.
+     */
+    public static function get_user_select_fields(): string {
+        $fields = array_merge(
+            ['id', 'idnumber'],
+            self::SAFE_STANDARD_FIELDS,
+            array_keys(self::ADVANCED_FIELDS),
+            self::INTERNAL_USER_FIELDS
+        );
+        return implode(', ', array_unique($fields));
+    }
+
+    /**
+     * Whether a value is acceptable for a fixed-choice Moodle field
+     * (country, language, calendar type) - delegated to core_user's own
+     * validation, the same check user_update_user() runs internally
+     * before it silently replaces an invalid value with the site default
+     * (confirmed against core source). An empty value is accepted: it
+     * means "no value", handled separately by the blank-clear protection.
+     */
+    public static function is_fixed_choice_value_valid(string $field, string $value): bool {
+        if ($value === '') {
+            return true;
+        }
+        return \core_user::validate([$field => $value]) === true;
     }
 
     /**

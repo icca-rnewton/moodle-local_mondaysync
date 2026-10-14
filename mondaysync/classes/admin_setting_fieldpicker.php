@@ -176,7 +176,8 @@ class admin_setting_fieldpicker extends \admin_setting {
     protected function standard_field_choices(): array {
         $choices = [];
         foreach (mapping_util::SAFE_STANDARD_FIELDS as $fieldname) {
-            $choices[$fieldname] = $this->standard_field_label($fieldname);
+            $choices[$fieldname] = $this->standard_field_label($fieldname)
+                . mapping_util::restriction_suffix('standard', $fieldname);
         }
         return $choices;
     }
@@ -188,7 +189,8 @@ class admin_setting_fieldpicker extends \admin_setting {
     protected function advanced_field_choices(): array {
         $choices = [];
         foreach (array_keys(mapping_util::ADVANCED_FIELDS) as $fieldname) {
-            $choices[$fieldname] = $this->advanced_field_label($fieldname);
+            $choices[$fieldname] = $this->advanced_field_label($fieldname)
+                . mapping_util::restriction_suffix('advanced', $fieldname);
         }
         return $choices;
     }
@@ -233,7 +235,7 @@ class admin_setting_fieldpicker extends \admin_setting {
         $labels = [
             'auth' => get_string('advancedfield_auth', 'local_mondaysync'),
             'suspended' => get_string('advancedfield_suspended', 'local_mondaysync'),
-            'lastlogin' => get_string('advancedfield_lastlogin', 'local_mondaysync'),
+            'currentlogin' => get_string('advancedfield_currentlogin', 'local_mondaysync'),
             'timecreated' => get_string('advancedfield_timecreated', 'local_mondaysync'),
             'username' => get_string('advancedfield_username', 'local_mondaysync'),
             'confirmed' => get_string('advancedfield_confirmed', 'local_mondaysync'),

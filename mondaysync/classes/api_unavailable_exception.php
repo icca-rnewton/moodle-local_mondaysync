@@ -47,4 +47,21 @@ defined('MOODLE_INTERNAL') || die();
  * Moodle's own retry/backoff handling applies.
  */
 class api_unavailable_exception extends \moodle_exception {
+
+    /**
+     * Whether this failure was Monday.com throttling the account (HTTP
+     * 429) rather than one request failing or one board being slow.
+     *
+     * Every Monday throttling case - concurrency, requests per minute,
+     * complexity budget, IP limit - is reported as HTTP 429 (confirmed
+     * against Monday's error-handling reference), and monday_client
+     * passes the HTTP status through as this exception's $a. Throttling
+     * is shared by every board on the same token, so once it happens
+     * there is no point sending the remaining boards' requests; any other
+     * availability failure (a timeout, a 5xx) may well be specific to one
+     * board and shouldn't stop the others.
+     */
+    public function is_rate_limited(): bool {
+        return (int)$this->a === 429;
+    }
 }

@@ -123,7 +123,8 @@ class mapping_form extends \moodleform {
         $standardchoices = [];
         foreach (\local_mondaysync\mapping_util::SAFE_STANDARD_FIELDS as $fieldname) {
             if (in_array('std:' . $fieldname, $enabledkeys, true)) {
-                $standardchoices['standard:' . $fieldname] = $this->standard_field_label($fieldname);
+                $standardchoices['standard:' . $fieldname] = $this->standard_field_label($fieldname)
+                    . \local_mondaysync\mapping_util::restriction_suffix('standard', $fieldname);
             }
         }
 
@@ -402,7 +403,7 @@ class mapping_form extends \moodleform {
             // failing) to split that string into date/time parts. This
             // plugin's 'date' mapping type (a genuine Moodle datetime
             // custom profile field), and - since this round - the
-            // lastlogin/timecreated advanced fields specifically, both
+            // currentlogin/timecreated advanced fields specifically, both
             // have that structured write path. Every other type
             // (standard, custom, and every other advanced field) always
             // formats its value as a plain readable string, which a Date
@@ -410,44 +411,46 @@ class mapping_form extends \moodleform {
             // explanation, rather than left to fail at sync time with a
             // cryptic Monday API error.
             $isdatecapable = (strpos($submitted, 'date:') === 0)
-                || ($submitted === 'advanced:lastlogin')
-                || ($submitted === 'advanced:timecreated');
+                || (preg_match('/^advanced:(.+)$/', (string) $submitted, $datematch)
+                    && \local_mondaysync\mapping_util::is_timestamp_field('advanced', $datematch[1]));
             if (!empty($submitted) && !$isdatecapable && ($col['type'] ?? '') === 'date') {
                 $errors['group_' . $col['id']] = get_string('cannotmapplaintextodatecolumn', 'local_mondaysync');
                 continue;
             }
 
-            // Advanced fields with a restricted direction set (e.g.
-            // lastlogin: Moodle -> Monday only) - catch a mismatched
-            // direction here with a clear message, rather than letting it
-            // save and then silently do nothing (parse() would otherwise
-            // just drop it at execution time with no obvious explanation).
-            if (!empty($submitted) && strpos($submitted, 'advanced:') === 0) {
-                $advfield = substr($submitted, strlen('advanced:'));
+            // Fields with a restricted direction set (e.g. currentlogin, email:
+            // Moodle -> Monday only) - catch a mismatched direction here
+            // with a clear message, rather than letting it save and then
+            // silently do nothing (parse() would otherwise just drop it at
+            // execution time with no obvious explanation). Covers Standard
+            // fields as well as Advanced ones (external review, item 1) -
+            // email and idnumber are Standard.
+            if (!empty($submitted) && preg_match('/^(standard|advanced):(.+)$/', $submitted, $restrictmatch)) {
+                $restricttype = $restrictmatch[1];
+                $restrictfield = $restrictmatch[2];
                 $direction = $data[$directionelname] ?? '';
 
-                // Mirrors the same fix in mapping.php's save loop: if this
-                // field only ever allows exactly one direction (e.g.
-                // lastlogin, timecreated), direction_lock_js() disables
-                // the visible <select> for it client-side - and a
-                // disabled element never submits its value at all, so
-                // $direction above would be empty here regardless of
-                // what the UI correctly shows. Without this, validation
-                // rejected the submission before mapping.php's own
-                // server-side forcing logic ever got a chance to run.
-                $singledirection = \local_mondaysync\mapping_util::ADVANCED_FIELDS[$advfield] ?? null;
-                if ($singledirection !== null && count($singledirection) === 1) {
-                    $direction = $singledirection[0];
+                // Mirrors the same fix in mapping.php's save step: if this
+                // field only ever allows exactly one direction,
+                // direction_lock_js() disables the visible <select> for it
+                // client-side - and a disabled element never submits its
+                // value at all, so $direction above would be empty here
+                // regardless of what the UI correctly shows. Without this,
+                // validation rejected the submission before mapping.php's
+                // own server-side forcing ever got a chance to run.
+                $forced = \local_mondaysync\mapping_util::get_forced_direction($restricttype, $restrictfield);
+                if ($forced !== null) {
+                    $direction = $forced;
                 }
 
-                if (!\local_mondaysync\mapping_util::is_direction_allowed('advanced', $advfield, $direction)) {
+                if (!\local_mondaysync\mapping_util::is_direction_allowed($restricttype, $restrictfield, $direction)) {
                     $a = new \stdClass();
-                    $a->field = $advfield;
+                    $a->field = $restrictfield;
                     $a->directions = implode(', ', array_map(
                         function ($d) {
                             return get_string('direction' . strtolower($d), 'local_mondaysync');
                         },
-                        \local_mondaysync\mapping_util::ADVANCED_FIELDS[$advfield] ?? []
+                        \local_mondaysync\mapping_util::get_allowed_directions($restricttype, $restrictfield)
                     ));
                     $errors['group_' . $col['id']] = get_string('directionrestricted', 'local_mondaysync', $a);
                 }
@@ -569,7 +572,7 @@ class mapping_form extends \moodleform {
         $labels = [
             'auth' => get_string('advancedfield_auth', 'local_mondaysync'),
             'suspended' => get_string('advancedfield_suspended', 'local_mondaysync'),
-            'lastlogin' => get_string('advancedfield_lastlogin', 'local_mondaysync'),
+            'currentlogin' => get_string('advancedfield_currentlogin', 'local_mondaysync'),
             'timecreated' => get_string('advancedfield_timecreated', 'local_mondaysync'),
             'username' => get_string('advancedfield_username', 'local_mondaysync'),
             'confirmed' => get_string('advancedfield_confirmed', 'local_mondaysync'),
@@ -753,12 +756,13 @@ class mapping_form extends \moodleform {
     /**
      * For every column, greys out and forces the direction dropdown
      * whenever its target field only ever allows one direction (e.g.
-     * lastlogin, timecreated - both toMonday-only since Moodle overwrites
+     * currentlogin, timecreated - both toMonday-only since Moodle overwrites
      * them itself) - purely a visual/UX aid, giving that clearly *before*
      * an attempted save rather than only as a validation error after one.
-     * Generic over whatever mapping_util::ADVANCED_FIELDS currently
-     * restricts, so a future single-direction field gets this treatment
-     * automatically rather than needing its own JS added.
+     * Generic over whatever the field catalogue currently locks (see
+     * mapping_util::get_forced_directions()), so a future single-direction
+     * field gets this treatment automatically rather than needing its own
+     * JS added.
      *
      * The server (mapping.php), not this script, is what actually
      * enforces the direction for these fields - disabling the visible
@@ -772,12 +776,9 @@ class mapping_form extends \moodleform {
      * method's own docblock.
      */
     protected function direction_lock_js(array $columns): string {
-        $singledirections = [];
-        foreach (\local_mondaysync\mapping_util::ADVANCED_FIELDS as $fieldname => $alloweddirections) {
-            if (count($alloweddirections) === 1) {
-                $singledirections['advanced:' . $fieldname] = $alloweddirections[0];
-            }
-        }
+        // Covers every locked field, Standard as well as Advanced, straight
+        // from the catalogue - not a separate list that could drift.
+        $singledirections = \local_mondaysync\mapping_util::get_forced_directions();
 
         $columnidsjson = json_encode(array_column($columns, 'id'));
         $singledirectionsjson = json_encode($singledirections);

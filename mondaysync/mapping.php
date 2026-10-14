@@ -129,8 +129,8 @@ if ($mform->is_cancelled()) {
             $direction = $data->$directionelname ?? \local_mondaysync\mapping_util::DEFAULT_DIRECTION;
 
             // If this field only ever allows exactly one direction (e.g.
-            // lastlogin, timecreated - both toMonday-only since Moodle
-            // overwrites them itself), that direction is authoritative
+            // currentlogin, timecreated, email, idnumber, username -
+            // Moodle -> Monday only), that direction is authoritative
             // here regardless of what was submitted - the server
             // enforces this, not the client. Keeps this correct even if
             // client-side JS has a bug, is disabled, or a request is
@@ -139,9 +139,12 @@ if ($mform->is_cancelled()) {
             // (a disabled <select> doesn't submit its value at all,
             // which would otherwise silently fall through to
             // DEFAULT_DIRECTION and be wrong for a toMonday-only field).
-            $singledirection = \local_mondaysync\mapping_util::ADVANCED_FIELDS[$field] ?? null;
-            if ($type === 'advanced' && $singledirection !== null && count($singledirection) === 1) {
-                $direction = $singledirection[0];
+            // Asks the catalogue by type AND field, so a custom profile
+            // field that merely shares a shortname with a locked core
+            // field isn't caught by mistake.
+            $forceddirection = \local_mondaysync\mapping_util::get_forced_direction($type, $field);
+            if ($forceddirection !== null) {
+                $direction = $forceddirection;
             }
 
             $allowclear = !empty($data->$allowclearelname);
