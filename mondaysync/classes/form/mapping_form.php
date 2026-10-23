@@ -64,6 +64,7 @@ class mapping_form extends \moodleform {
         $matchingcolumnid = $this->_customdata['matchingcolumnid'];
         $rawmappings = $this->_customdata['rawmappings'];
         $customfields = $this->_customdata['customfields'];
+        $gradeitems = $this->_customdata['gradecatalogue']['items'] ?? [];
 
         $livecolumnids = array_column($columns, 'id');
 
@@ -156,6 +157,23 @@ class mapping_form extends \moodleform {
             }
         }
 
+        // Grade items of the board's linked course, by ID number. Items
+        // sharing an ID number aren't offered (the sync would skip them
+        // anyway) - they're listed in the grade note below instead.
+        $gradechoices = [];
+        foreach ($gradeitems as $idnumber => $info) {
+            if (!empty($info['duplicate'])) {
+                continue;
+            }
+            $gradechoices['grade:' . $idnumber] = $this->grade_item_label((string)$idnumber, $info, $gradeitems);
+        }
+        if (!empty($gradechoices)) {
+            $targetgroups[] = [
+                'header' => get_string('gradesgroupheader', 'local_mondaysync', $this->_customdata['coursename'] ?? ''),
+                'choices' => $gradechoices,
+            ];
+        }
+
         // Flat list of every real (non-header) value across every group,
         // for validation() to check submissions against.
         $this->validtargetoptions = [''];
@@ -164,6 +182,11 @@ class mapping_form extends \moodleform {
         }
 
         $mform->addElement('static', 'advancedwarning', '', $this->warning(get_string('advancedwarning', 'local_mondaysync')));
+
+        $gradenote = $this->grade_note_html();
+        if ($gradenote !== '') {
+            $mform->addElement('static', 'gradenote', get_string('gradesnoteheading', 'local_mondaysync'), $gradenote);
+        }
 
         $mform->addElement('static', 'columnfilter', '', $this->column_picker_html($columns, $rawmappings));
 
@@ -181,6 +204,7 @@ class mapping_form extends \moodleform {
         foreach ($columns as $col) {
             $targetelname = 'target_' . $col['id'];
             $directionelname = 'direction_' . $col['id'];
+            $allowclearelname = 'allowclear_' . $col['id'];
             $label = $this->column_label($col);
 
             // This column may need one extra "orphaned" option, if its
@@ -194,7 +218,7 @@ class mapping_form extends \moodleform {
             if ($saved !== null) {
                 $current = $saved['type'] . ':' . $saved['field'];
                 if (!in_array($current, $this->validtargetoptions, true)) {
-                    $desc = \local_mondaysync\mapping_util::describe_mapping_target($saved, $customfields);
+                    $desc = \local_mondaysync\mapping_util::describe_mapping_target($saved, $customfields, $gradeitems);
                     $orphangroup = ['header' => get_string('orphanedgroupheader', 'local_mondaysync'), 'choices' => [$current => $desc]];
                     $this->allowedorphanvalues[$col['id']] = $current;
                     $this->validtargetoptions[] = $current;
@@ -236,6 +260,7 @@ class mapping_form extends \moodleform {
                 // orphan handling above added it via $orphangroup.
                 $mform->setDefault($targetelname, $saved['type'] . ':' . $saved['field']);
                 $mform->setDefault($directionelname, $saved['direction']);
+                $mform->setDefault($allowclearelname, !empty($saved['allowclear']) ? 1 : 0);
             }
         }
 
@@ -247,7 +272,7 @@ class mapping_form extends \moodleform {
             $mform->addElement('static', 'orphanintro', '', get_string('orphanedmappingsintro', 'local_mondaysync'));
 
             foreach ($orphanedbycolumn as $columnid => $mapping) {
-                $desc = \local_mondaysync\mapping_util::describe_mapping_target($mapping, $customfields);
+                $desc = \local_mondaysync\mapping_util::describe_mapping_target($mapping, $customfields, $gradeitems);
                 $removeelname = 'orphan_remove_' . $columnid;
 
                 $mform->addElement('advcheckbox', $removeelname,
@@ -359,6 +384,7 @@ class mapping_form extends \moodleform {
      */
     public function validation($data, $files) {
         $errors = parent::validation($data, $files);
+        $gradeitems = $this->_customdata['gradecatalogue']['items'] ?? [];
 
         if (!in_array($data['matchingcolumnid'], $this->validcolumnids, true)) {
             $errors['matchingcolumnid'] = get_string('invalidselection', 'local_mondaysync');
@@ -418,6 +444,22 @@ class mapping_form extends \moodleform {
                 continue;
             }
 
+            // Grades go to Text columns, or Numbers columns for points (a
+            // scale grade is synced as its label, which a Numbers column
+            // can't hold). Checked here rather than left to fail at sync
+            // time. An orphaned grade mapping resubmitted unchanged is
+            // left alone - it never executes.
+            if (!empty($submitted) && strpos($submitted, 'grade:') === 0 && $submitted !== $allowedorphan) {
+                $gradeid = substr($submitted, strlen('grade:'));
+                $columntype = (string)($col['type'] ?? '');
+                $typeallowed = !isset($gradeitems[$gradeid])
+                    || \local_mondaysync\mapping_util::grade_column_type_allowed($gradeitems[$gradeid], $columntype);
+                if (!$typeallowed) {
+                    $errors['group_' . $col['id']] = get_string('gradecolumntypenotallowed', 'local_mondaysync');
+                    continue;
+                }
+            }
+
             // Fields with a restricted direction set (e.g. currentlogin, email:
             // Moodle -> Monday only) - catch a mismatched direction here
             // with a clear message, rather than letting it save and then
@@ -425,7 +467,7 @@ class mapping_form extends \moodleform {
             // execution time with no obvious explanation). Covers Standard
             // fields as well as Advanced ones (external review, item 1) -
             // email and idnumber are Standard.
-            if (!empty($submitted) && preg_match('/^(standard|advanced):(.+)$/', $submitted, $restrictmatch)) {
+            if (!empty($submitted) && preg_match('/^(standard|advanced|grade):(.+)$/', $submitted, $restrictmatch)) {
                 $restricttype = $restrictmatch[1];
                 $restrictfield = $restrictmatch[2];
                 $direction = $data[$directionelname] ?? '';
@@ -438,19 +480,19 @@ class mapping_form extends \moodleform {
                 // regardless of what the UI correctly shows. Without this,
                 // validation rejected the submission before mapping.php's
                 // own server-side forcing ever got a chance to run.
-                $forced = \local_mondaysync\mapping_util::get_forced_direction($restricttype, $restrictfield);
+                $forced = \local_mondaysync\mapping_util::get_forced_direction($restricttype, $restrictfield, $gradeitems);
                 if ($forced !== null) {
                     $direction = $forced;
                 }
 
-                if (!\local_mondaysync\mapping_util::is_direction_allowed($restricttype, $restrictfield, $direction)) {
+                if (!\local_mondaysync\mapping_util::is_direction_allowed($restricttype, $restrictfield, $direction, $gradeitems)) {
                     $a = new \stdClass();
                     $a->field = $restrictfield;
                     $a->directions = implode(', ', array_map(
                         function ($d) {
                             return get_string('direction' . strtolower($d), 'local_mondaysync');
                         },
-                        \local_mondaysync\mapping_util::get_allowed_directions($restricttype, $restrictfield)
+                        \local_mondaysync\mapping_util::get_allowed_directions($restricttype, $restrictfield, $gradeitems)
                     ));
                     $errors['group_' . $col['id']] = get_string('directionrestricted', 'local_mondaysync', $a);
                 }
@@ -651,6 +693,79 @@ class mapping_form extends \moodleform {
         }
     }
 
+    /**
+     * Option label for a grade item: its name, ID number and kind (manual
+     * item, quiz, course total...), plus the usual " (Moodle -> Monday
+     * only)" note when it can't be written to. The name is already
+     * escaped by grade_item::get_name(); the ID number is escaped here,
+     * since select option text is output without escaping.
+     */
+    protected function grade_item_label(string $idnumber, array $info, array $gradeitems): string {
+        return $info['name'] . ' (' . s($idnumber) . ', ' . s($this->grade_item_kind_label($info)) . ')'
+            . \local_mondaysync\mapping_util::restriction_suffix('grade', $idnumber, $gradeitems);
+    }
+
+    /**
+     * Human label for a grade item's kind, using core's own strings.
+     */
+    protected function grade_item_kind_label(array $info): string {
+        switch ($info['kind']) {
+            case 'manual':
+                return get_string('manualitem', 'grades');
+            case 'calculated':
+                return get_string('calculation', 'grades');
+            case 'outcome':
+                return get_string('outcome', 'grades');
+            case 'course':
+                return get_string('coursetotal', 'grades');
+            case 'category':
+                return get_string('categorytotal', 'grades');
+            case 'mod':
+                $component = 'mod_' . $info['itemmodule'];
+                if ($info['itemmodule'] !== '' && get_string_manager()->string_exists('modulename', $component)) {
+                    return get_string('modulename', $component);
+                }
+                return $info['itemmodule'];
+        }
+        return $info['kind'];
+    }
+
+    /**
+     * The note shown with the grade options: no course linked, a linked
+     * course that has gone, or the course's grade items that can't be
+     * mapped and why (no ID number, an ID number the mapping format can't
+     * hold, an ID number shared by more than one item, or no grade at
+     * all). Empty when there is nothing to say.
+     */
+    protected function grade_note_html(): string {
+        $courseid = (int)($this->_customdata['courseid'] ?? 0);
+        if ($courseid === 0) {
+            return \html_writer::span(get_string('gradesnocourse', 'local_mondaysync'), 'text-muted');
+        }
+        if (($this->_customdata['coursename'] ?? null) === null) {
+            return $this->warning(get_string('gradescoursemissing', 'local_mondaysync'));
+        }
+
+        $catalogue = $this->_customdata['gradecatalogue'] ?? ['items' => [], 'unmappable' => []];
+        $lines = [];
+        foreach ($catalogue['items'] as $idnumber => $info) {
+            if (!empty($info['duplicate'])) {
+                $lines[] = get_string('gradeunmappable_duplicate', 'local_mondaysync', s($idnumber));
+            }
+        }
+        foreach ($catalogue['unmappable'] as $u) {
+            $a = (object)['name' => $u['name'], 'idnumber' => s($u['idnumber'])];
+            $lines[] = get_string('gradeunmappable_' . $u['reason'], 'local_mondaysync', $a);
+        }
+
+        $html = \html_writer::span(get_string('gradesintro', 'local_mondaysync'), 'text-muted');
+        if (!empty($lines)) {
+            $html .= \html_writer::tag('p', get_string('gradesunmappableintro', 'local_mondaysync'), ['class' => 'mb-1 mt-2'])
+                . \html_writer::alist($lines, ['class' => 'text-muted small mb-0']);
+        }
+        return $html;
+    }
+
     protected function warning(string $text): string {
         return \html_writer::span('⚠ ' . $text, 'text-danger');
     }
@@ -778,7 +893,8 @@ class mapping_form extends \moodleform {
     protected function direction_lock_js(array $columns): string {
         // Covers every locked field, Standard as well as Advanced, straight
         // from the catalogue - not a separate list that could drift.
-        $singledirections = \local_mondaysync\mapping_util::get_forced_directions();
+        $gradeitems = $this->_customdata['gradecatalogue']['items'] ?? [];
+        $singledirections = \local_mondaysync\mapping_util::get_forced_directions($gradeitems);
 
         $columnidsjson = json_encode(array_column($columns, 'id'));
         $singledirectionsjson = json_encode($singledirections);

@@ -29,7 +29,7 @@ $id = required_param('id', PARAM_INT);
 
 admin_externalpage_setup('local_mondaysync_boards');
 
-global $OUTPUT, $PAGE;
+global $DB, $OUTPUT, $PAGE;
 
 $boardslisturl = new moodle_url('/local/mondaysync/boards.php');
 
@@ -83,11 +83,24 @@ if (empty($columns)) {
 
 $rawmappings = \local_mondaysync\mapping_util::parse_raw((string)$board->fieldmappings);
 
+// Grade items of the board's linked course (empty if none). The form
+// offers them as targets, and the save step below asks this same
+// catalogue which direction each is locked to.
+$boardcourseid = (int)($board->courseid ?? 0);
+$gradecatalogue = \local_mondaysync\mapping_util::get_grade_catalogue($boardcourseid ?: null);
+$coursename = null;
+if ($boardcourseid > 0 && ($course = $DB->get_record('course', ['id' => $boardcourseid], 'id, fullname'))) {
+    $coursename = format_string($course->fullname, true, ['context' => context_course::instance($course->id)]);
+}
+
 $customdata = [
     'columns' => $columns,
     'matchingcolumnid' => $board->matchingcolumnid,
     'rawmappings' => $rawmappings,
     'customfields' => \local_mondaysync\mapping_util::get_custom_fields(),
+    'gradecatalogue' => $gradecatalogue,
+    'courseid' => $boardcourseid,
+    'coursename' => $coursename,
     'suspendedlabelyes' => $board->suspendedlabelyes ?? '',
     'suspendedlabelno' => $board->suspendedlabelno ?? '',
     'createusers' => $board->createusers ?? 0,
@@ -142,7 +155,7 @@ if ($mform->is_cancelled()) {
             // Asks the catalogue by type AND field, so a custom profile
             // field that merely shares a shortname with a locked core
             // field isn't caught by mistake.
-            $forceddirection = \local_mondaysync\mapping_util::get_forced_direction($type, $field);
+            $forceddirection = \local_mondaysync\mapping_util::get_forced_direction($type, $field, $gradecatalogue['items']);
             if ($forceddirection !== null) {
                 $direction = $forceddirection;
             }

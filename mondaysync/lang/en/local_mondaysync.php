@@ -54,7 +54,7 @@ $string['matchingcolumnid_desc'] = 'The Monday.com column ID (not the display ti
 $string['matchingcolumnmissing'] = 'The currently-saved matching column ("{$a}") no longer exists on this board. Syncing is paused for this board until you choose a new one below.';
 
 // Task.
-$string['synctask'] = 'Sync Monday.com boards to Moodle profile fields';
+$string['synctask'] = 'Sync Monday.com boards (profile fields and grades)';
 
 // Connected Boards page.
 $string['boardsheading'] = 'Connected Boards';
@@ -165,6 +165,23 @@ $string['standardfieldoption'] = 'Standard field: {$a}';
 $string['customfieldoption'] = 'Custom field: {$a->name} ({$a->shortname}, {$a->datatype})';
 $string['gradeitemoption'] = 'Grade: {$a->name} ({$a->idnumber})';
 $string['deletedgradeitemdesc'] = 'a grade item that is no longer in the linked course (ID number {$a})';
+$string['gradesgroupheader'] = 'Grades: {$a}';
+$string['gradesnoteheading'] = 'Grades';
+$string['gradesnocourse'] = 'To map grades, link this board to a course in its board settings (Connected Boards > Edit).';
+$string['gradescoursemissing'] = 'The course this board is linked to for grade sync no longer exists. Edit the board to choose another course, or remove its grade mappings.';
+$string['gradesintro'] = 'Grade items from the linked course are listed under "Grades" in each column\'s dropdown, by name and ID number. Only manual grade items can be filled in from Monday.com; everything else (activities, totals, calculated items) is Moodle → Monday only. Use a Text column for any grade, a Numbers column for points, or a Status column for a scale grade (with status options named exactly as the scale\'s labels).';
+$string['gradesunmappableintro'] = 'These grade items can\'t be mapped:';
+$string['gradeunmappable_noidnumber'] = '{$a->name}: no ID number. Give it one in Gradebook setup (Edit > ID number).';
+$string['gradeunmappable_unsafeidnumber'] = '{$a->name}: its ID number "{$a->idnumber}" contains a colon, a line break or spaces at either end, or is longer than 100 characters, which the mapping can\'t store. Change the ID number in Gradebook setup.';
+$string['gradeunmappable_notgraded'] = '{$a->name}: has no grade to sync (grade type None or Text).';
+$string['gradeunmappable_duplicate'] = 'ID number "{$a}" is used by more than one grade item in this course, so it can\'t tell which one is meant. Give each item its own ID number.';
+$string['gradecolumntypenotallowed'] = 'Grades can be mapped to a Text column (any grade), a Numbers column (points only) or a Status column (scale grades only, with status options named exactly as the scale\'s labels).';
+$string['gradegraderusername'] = 'Grade sync account';
+$string['gradegraderusername_desc'] = 'Username of the account that Moodle\'s grade history records as having entered grades pulled from Monday.com, for example a dedicated "Monday.com Sync" account with the No login authentication method and no roles. Leave blank to record them as the site administrator; if the account can\'t be found, the site administrator is used and a warning is logged.';
+$string['errorgradenotwritable'] = 'Grade item "{$a}" can\'t be filled in from Monday.com - only manual grade items with no calculation can (the item may have changed since this mapping was saved)';
+$string['errorgradelocked'] = 'This learner\'s grade for grade item "{$a}" is locked in Moodle, so it was left unchanged';
+$string['errorgradeinvalid'] = '"{$a}" is not a valid grade for this item';
+$string['errorgraderefused'] = 'Moodle declined to update grade item "{$a}" (for example its lock date has passed), so it was left unchanged';
 $string['savemapping'] = 'Save mapping';
 $string['mappingsaved'] = 'Mapping saved.';
 $string['invalidselection'] = 'That selection isn\'t one of the available options - please choose from the dropdown.';
@@ -210,7 +227,7 @@ $string['errornotconfigured'] = 'local_mondaysync is not fully configured (missi
 $string['errorbaddate'] = 'Could not parse "{$a}" as a date - value left unchanged.';
 
 // Privacy.
-$string['privacy:metadata:local_mondaysync_log'] = 'A record of profile field changes this plugin has applied to a user, and of any new Moodle account it has created from a Monday.com board row, kept for audit and debugging.';
+$string['privacy:metadata:local_mondaysync_log'] = 'A record of profile field and grade changes this plugin has applied to a user, and of any new Moodle account it has created from a Monday.com board row, kept for audit and debugging.';
 $string['privacy:metadata:local_mondaysync_log:userid'] = 'The Moodle user whose profile field was changed, or who was created.';
 $string['privacy:metadata:local_mondaysync_log:field'] = 'Which profile field was changed (not applicable to account-creation entries).';
 $string['privacy:metadata:local_mondaysync_log:oldvalue'] = 'The field\'s value before this change.';
@@ -232,4 +249,6 @@ $string['privacy:metadata:mondaycom'] = 'To match a Monday.com board row to a Mo
 $string['privacy:metadata:mondaycom:idnumber'] = 'The Moodle user\'s ID Number profile field.';
 $string['privacy:metadata:mondaycom:fieldvalue'] = 'The current value of any profile field mapped with a Moodle → Monday, or Both ways, sync direction.';
 $string['privacy:metadata:mondaycom:newaccountdata'] = 'First name, last name, email address, and username read from Monday.com to create a new Moodle account, where a board is configured to do so.';
+$string['privacy:metadata:mondaycom:grades'] = 'For a board linked to a course for grade sync, the learner\'s grade for each mapped grade item (Moodle → Monday or Both ways), and, for manual grade items mapped Monday → Moodle or Both ways, the grade read back from the board and written into the Moodle gradebook.';
+$string['privacy:metadata:core_grades'] = 'Grades read from a Monday.com board are written into the Moodle gradebook, which holds and manages them.';
 $string['privacy:unknownboard'] = '(board since deleted)';

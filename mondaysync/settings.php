@@ -76,6 +76,17 @@ if ($hassiteconfig) {
         PARAM_INT
     ));
 
+    // Grade sync: the account Moodle's grade history records as having
+    // entered grades pulled from Monday.com. Blank, or an account that
+    // can't be found, means the site administrator (logged per run).
+    $settings->add(new admin_setting_configtext(
+        'local_mondaysync/gradegraderusername',
+        get_string('gradegraderusername', 'local_mondaysync'),
+        get_string('gradegraderusername_desc', 'local_mondaysync'),
+        '',
+        PARAM_USERNAME
+    ));
+
     // Moodle Workplace multi-tenancy (only shown if that plugin is
     // installed). 2026 addition (external review, item 5): without this,
     // any value in a board's per-row tenant column that happened to match

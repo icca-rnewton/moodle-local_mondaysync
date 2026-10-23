@@ -249,6 +249,24 @@ class mapping_util {
     const GRADE_WRITABLE_ITEMTYPES = ['manual'];
 
     /**
+     * Monday.com column types a grade mapping may target, and for which
+     * grade types (GRADE_SYNCABLE_GRADETYPES values: 1 points, 2 scale):
+     * - Text: any grade;
+     * - Numbers: points only - a scale grade is synced as its label (e.g.
+     *   "Merit"), which a Numbers column can't hold;
+     * - Status: scale only - each status option is a scale label, written
+     *   and read by its label text. Monday.com rejects a label the column
+     *   doesn't have (the plugin never asks it to create one), so a
+     *   mismatch is logged rather than adding stray options.
+     * Checked by the mapping wizard; see grade_column_type_allowed().
+     */
+    const GRADE_COLUMN_TYPES = [
+        'text' => [1, 2],
+        'numbers' => [1],
+        'status' => [2],
+    ];
+
+    /**
      * Interpret a piece of text from a Monday.com column as a suspended/
      * not-suspended boolean, accepting several common phrasings so Ops can
      * label their Status column however reads naturally to them, rather
@@ -570,9 +588,14 @@ class mapping_util {
      * other control character, or leading/trailing spaces, would be read
      * back as something else. Those items are listed in the wizard as
      * unmappable rather than offered.
+     *
+     * Also at most 100 characters: the sync log's field column (char 100)
+     * records the ID number for every grade change, and Moodle allows up
+     * to 255.
      */
     public static function is_safe_grade_idnumber(string $idnumber): bool {
         return $idnumber !== ''
+            && \core_text::strlen($idnumber) <= 100
             && $idnumber === trim($idnumber)
             && strpos($idnumber, ':') === false
             && !preg_match('/[\x00-\x1F\x7F]/', $idnumber);
@@ -594,6 +617,35 @@ class mapping_util {
     }
 
     /**
+     * What sort of grade item this is, for labelling it in the wizard:
+     * 'outcome', 'calculated' (any item with a formula), or otherwise its
+     * item type - 'manual', 'mod', 'course' or 'category'.
+     *
+     * @param \grade_item $item
+     */
+    public static function grade_item_kind($item): string {
+        if (!empty($item->outcomeid)) {
+            return 'outcome';
+        }
+        if ($item->is_calculated()) {
+            return 'calculated';
+        }
+        return (string)$item->itemtype;
+    }
+
+    /**
+     * Whether a grade item can be mapped to a Monday.com column of this
+     * type - see GRADE_COLUMN_TYPES.
+     *
+     * @param array $iteminfo One entry of get_grade_catalogue()['items']
+     * @param string $columntype Monday.com column type, e.g. 'text'
+     */
+    public static function grade_column_type_allowed(array $iteminfo, string $columntype): bool {
+        $gradetypes = self::GRADE_COLUMN_TYPES[$columntype] ?? [];
+        return in_array((int)$iteminfo['gradetype'], $gradetypes, true);
+    }
+
+    /**
      * The grade items of a course that grade mappings can use, keyed by
      * ID number, plus the items that can't be used and why (so the wizard
      * can explain rather than silently leave them out).
@@ -610,6 +662,7 @@ class mapping_util {
      * @param int|null $courseid
      * @return array ['items' => [idnumber => [
      *                    'id', 'name', 'itemtype', 'itemmodule', 'gradetype', 'scaleid',
+     *                    'kind' => 'manual'|'calculated'|'outcome'|'mod'|'course'|'category',
      *                    'writable' => bool, 'duplicate' => bool]],
      *                'unmappable' => [['name', 'idnumber', 'reason' => 'noidnumber'|'unsafeidnumber'|'notgraded']]]
      */
@@ -659,6 +712,7 @@ class mapping_util {
                 'itemmodule' => (string)($item->itemmodule ?? ''),
                 'gradetype' => (int)$item->gradetype,
                 'scaleid' => (int)($item->scaleid ?? 0),
+                'kind' => self::grade_item_kind($item),
                 'writable' => self::is_grade_item_writable($item),
                 'duplicate' => false,
             ];

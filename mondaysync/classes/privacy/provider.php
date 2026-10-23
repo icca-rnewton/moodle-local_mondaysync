@@ -106,9 +106,17 @@ class provider implements
                 'idnumber' => 'privacy:metadata:mondaycom:idnumber',
                 'fieldvalue' => 'privacy:metadata:mondaycom:fieldvalue',
                 'newaccountdata' => 'privacy:metadata:mondaycom:newaccountdata',
+                'grades' => 'privacy:metadata:mondaycom:grades',
             ],
             'privacy:metadata:mondaycom'
         );
+
+        // Grade sync writes grades pulled from Monday.com into Moodle's own
+        // gradebook, through the grades API. Those grades belong to
+        // core_grades, which exports and deletes them itself - so they are
+        // disclosed as a link to that subsystem, not claimed as this
+        // plugin's own table.
+        $collection->add_subsystem_link('core_grades', [], 'privacy:metadata:core_grades');
 
         return $collection;
     }

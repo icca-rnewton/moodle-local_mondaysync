@@ -79,6 +79,15 @@ class sync_manager {
      */
     protected array $pendingwelcome = [];
 
+    /**
+     * Grade sync state for the board currently being processed, or null
+     * if it has no grade mappings in use this run - see
+     * load_grade_context().
+     *
+     * @var \stdClass|null
+     */
+    protected ?\stdClass $gradecontext = null;
+
     /** Most automatic attempts at a welcome email, in all, before it is handed to an admin. */
     const WELCOME_EMAIL_MAX_ATTEMPTS = 3;
 
@@ -136,6 +145,7 @@ class sync_manager {
             }
 
             $this->deferredavailability = null;
+            $this->gradecontext = null;
             $failure = null;
             try {
                 $this->run_board($client, $board);
@@ -230,7 +240,11 @@ class sync_manager {
         global $DB;
 
         $matchingcolumnid = trim((string)$board->matchingcolumnid);
-        $mappings = mapping_util::parse((string)$board->fieldmappings);
+        // Grade mappings are only valid against the grade items of the
+        // board's linked course, so parse() needs that catalogue - without
+        // it they are dropped (mapping_util fails closed).
+        $gradecatalogue = $this->board_grade_catalogue($board);
+        $mappings = mapping_util::parse((string)$board->fieldmappings, $gradecatalogue['items']);
 
         if (empty($matchingcolumnid) || empty($mappings)) {
             mtrace('local_mondaysync: board "' . $board->name . '" has no matching column / mappings configured yet, skipping.');
@@ -268,7 +282,7 @@ class sync_manager {
             return;
         }
 
-        $this->log_orphaned_mappings($DB, $board, $mappings, $livecolumnids);
+        $this->log_orphaned_mappings($DB, $board, $mappings, $livecolumnids, $gradecatalogue['items']);
 
         $statusindices = ['created' => null, 'error' => null];
         $cancreate = false;
@@ -331,6 +345,12 @@ class sync_manager {
         }
 
         mtrace('local_mondaysync: board "' . $board->name . '" - fetched ' . count($items) . ' item(s)');
+
+        // Loaded only now, after Monday.com has answered, so an outage
+        // never costs a course regrade for nothing. A Moodle-side problem
+        // here drops this board's grade mappings for the run and is
+        // logged; everything else on the board still syncs.
+        $mappings = $this->load_grade_context($DB, $board, $mappings, $gradecatalogue);
 
         $this->pendingwelcome = $this->load_pending_welcome_users($DB, $board);
 
@@ -434,13 +454,13 @@ class sync_manager {
      * One line per run, not one per affected item, since this is a
      * configuration issue rather than a per-row sync event.
      */
-    protected function log_orphaned_mappings(\moodle_database $DB, \stdClass $board, array $validmappings, array $livecolumnids): void {
+    protected function log_orphaned_mappings(\moodle_database $DB, \stdClass $board, array $validmappings, array $livecolumnids, array $gradeitems = []): void {
         $rawmappings = mapping_util::parse_raw((string)$board->fieldmappings);
         $customfields = mapping_util::get_custom_fields();
 
         $problems = [];
         foreach ($rawmappings as $columnid => $mapping) {
-            $moodleok = mapping_util::is_valid_field($mapping['type'], $mapping['field'], $customfields);
+            $moodleok = mapping_util::is_valid_field($mapping['type'], $mapping['field'], $customfields, $gradeitems);
             $mondayok = in_array($columnid, $livecolumnids, true);
             // A saved direction can become disallowed after the fact (a
             // field later restricted to Moodle -> Monday only). parse()
@@ -448,7 +468,7 @@ class sync_manager {
             // it's visible why a mapping stopped doing anything, rather
             // than just going quiet.
             $directionok = !$moodleok
-                || mapping_util::is_direction_allowed($mapping['type'], $mapping['field'], $mapping['direction']);
+                || mapping_util::is_direction_allowed($mapping['type'], $mapping['field'], $mapping['direction'], $gradeitems);
 
             if ($moodleok && $mondayok && $directionok) {
                 continue;
@@ -458,11 +478,13 @@ class sync_manager {
             if (!$mondayok) {
                 $reasons[] = 'Monday column no longer exists';
             }
-            if (!$moodleok) {
+            if (!$moodleok && $mapping['type'] === 'grade') {
+                $reasons[] = $this->grade_mapping_problem($board, $mapping['field']);
+            } else if (!$moodleok) {
                 $reasons[] = 'Moodle field "' . $mapping['field'] . '" no longer exists';
             } else if (!$directionok) {
                 $reasons[] = 'Moodle field "' . $mapping['field'] . '" can no longer be synced "' . $mapping['direction']
-                    . '" - it is now ' . implode('/', mapping_util::get_allowed_directions($mapping['type'], $mapping['field']))
+                    . '" - it is now ' . implode('/', mapping_util::get_allowed_directions($mapping['type'], $mapping['field'], $gradeitems))
                     . ' only; re-save this mapping in the wizard';
             }
             $problems[] = $columnid . ' (' . implode('; ', $reasons) . ')';
@@ -552,8 +574,22 @@ class sync_manager {
 
         $this->recover_welcome_email($DB, $client, $board, $itemid, $user);
 
+        // Grades only sync for learners actively enrolled in the board's
+        // course. Anyone else on the board still has their profile
+        // fields synced; their grade columns are skipped, logged once per
+        // row rather than once per column.
+        $hasgrademappings = in_array('grade', array_column($mappings, 'type'), true);
+        $skipgrades = $this->gradecontext !== null && $hasgrademappings && !isset($this->gradecontext->enrolled[(int)$user->id]);
+        if ($skipgrades) {
+            $this->log($DB, $board->id, $itemid, $user->id, null, null, null, 'skipped',
+                'Not actively enrolled in the course this board syncs grades with - grade columns skipped for this row.');
+        }
+
         foreach ($mappings as $columnid => $mapping) {
             if ($columnid === $matchingcolumnid) {
+                continue;
+            }
+            if ($mapping['type'] === 'grade' && ($skipgrades || $this->gradecontext === null)) {
                 continue;
             }
             if (!array_key_exists($columnid, $item['columns'])) {
@@ -1062,6 +1098,27 @@ class sync_manager {
             $mondayvalue = ($mondayvalue !== '') ? '1' : '0';
         }
 
+        if ($mapping['type'] === 'grade') {
+            // Same shape as the date and checkbox fixes above: bring
+            // Monday's text into exactly the form Moodle's side uses
+            // (points at the item's own display decimals, a scale grade as
+            // the scale's own spelling of the label), so a value that
+            // hasn't changed never looks changed. A value that isn't a
+            // valid grade for this item is refused if it could be written
+            // into Moodle; for Moodle -> Monday it is left as it is, so it
+            // differs and gets corrected.
+            [$canonical, $problem] = $this->check_monday_grade($mapping['field'], $mondayvalue);
+            if ($problem !== null) {
+                if (in_array($direction, ['toMoodle', 'both'], true)) {
+                    $this->log($DB, $board->id, $itemid, $user->id, $mapping['field'], null, $mondayvalue, 'error',
+                        $problem . ' - grade left unchanged.');
+                    return;
+                }
+            } else {
+                $mondayvalue = $canonical;
+            }
+        }
+
         if ($direction === 'toMoodle') {
             if ($mondayvalue !== $moodlevalue) {
                 if ($this->blocked_by_clear_protection($mapping, $mondayvalue)) {
@@ -1200,6 +1257,10 @@ class sync_manager {
      * two sides can be compared directly.
      */
     protected function get_moodle_value(\moodle_database $DB, \stdClass $user, array $mapping): string {
+        if ($mapping['type'] === 'grade') {
+            return $this->moodle_grade_text($mapping['field'], (int)$user->id);
+        }
+
         if ($mapping['type'] === 'standard') {
             return trim((string)($user->{$mapping['field']} ?? ''));
         }
@@ -1547,6 +1608,11 @@ class sync_manager {
     protected function apply_to_moodle(int $userid, array $mapping, string $newvalue): void {
         global $CFG;
 
+        if ($mapping['type'] === 'grade') {
+            $this->write_grade($userid, $mapping['field'], $newvalue);
+            return;
+        }
+
         if ($mapping['type'] === 'standard' || $mapping['type'] === 'advanced') {
             // user_update_user() lives in /user/lib.php, which isn't always
             // already loaded (it happened to work in earlier testing only
@@ -1745,6 +1811,265 @@ class sync_manager {
             throw new \moodle_exception('errorbaddate', 'local_mondaysync', '', $value);
         }
         return $timestamp;
+    }
+
+    /**
+     * The grade catalogue of the board's linked course - but only loaded
+     * if the board actually has a grade mapping, so boards that only sync
+     * profile fields cost nothing extra.
+     */
+    protected function board_grade_catalogue(\stdClass $board): array {
+        $raw = mapping_util::parse_raw((string)$board->fieldmappings);
+        if (!in_array('grade', array_column($raw, 'type'), true)) {
+            return ['items' => [], 'unmappable' => []];
+        }
+        $courseid = (int)($board->courseid ?? 0);
+        return mapping_util::get_grade_catalogue($courseid ?: null);
+    }
+
+    /**
+     * Why a grade mapping can't be used, for the per-run warning.
+     */
+    protected function grade_mapping_problem(\stdClass $board, string $idnumber): string {
+        global $DB;
+        $courseid = (int)($board->courseid ?? 0);
+        if ($courseid === 0) {
+            return 'this board is not linked to a course, so grade item "' . $idnumber . '" can\'t be found';
+        }
+        if (!$DB->record_exists('course', ['id' => $courseid])) {
+            return 'the course this board syncs grades with (id ' . $courseid . ') no longer exists';
+        }
+        return 'no single grade item in the linked course has the ID number "' . $idnumber
+            . '" (it was removed, its ID number changed, or more than one item shares it)';
+    }
+
+    /**
+     * Load what grade mappings need for this board's run, once: each mapped
+     * item's current grades (one query per item, not per learner), its
+     * display decimals and scale labels, the learners actively enrolled in
+     * the course, and the account grades pulled from Monday.com are
+     * recorded as. Sets $this->gradecontext, or leaves it null if the
+     * board has no grade mappings.
+     *
+     * If the course needs its grades recalculated first (Moodle does this
+     * lazily), that happens here, so totals aren't stale when pushed. If
+     * the recalculation reports errors, or anything else Moodle-side fails,
+     * this board's grade mappings are dropped for the run and the problem
+     * is logged - the board's other mappings still run. Nothing here
+     * talks to Monday.com.
+     *
+     * @return array The mappings to process (grade mappings removed on failure)
+     */
+    protected function load_grade_context(\moodle_database $DB, \stdClass $board, array $mappings, array $catalogue): array {
+        global $CFG;
+
+        $this->gradecontext = null;
+        $grademappings = array_filter($mappings, function ($m) {
+            return $m['type'] === 'grade';
+        });
+        if (empty($grademappings)) {
+            return $mappings;
+        }
+        $withoutgrades = array_filter($mappings, function ($m) {
+            return $m['type'] !== 'grade';
+        });
+
+        require_once($CFG->libdir . '/gradelib.php');
+        $courseid = (int)$board->courseid;
+
+        try {
+            if (grade_needs_regrade_final_grades($courseid)) {
+                $result = grade_regrade_final_grades($courseid);
+                if ($result !== true) {
+                    $this->log($DB, $board->id, '(board)', null, null, null, null, 'error',
+                        'Moodle could not recalculate the grades of the linked course, so its grade columns were skipped this run: '
+                        . implode('; ', (array)$result));
+                    return $withoutgrades;
+                }
+            }
+
+            $context = new \stdClass();
+            $context->courseid = $courseid;
+            $context->items = [];
+            foreach (array_unique(array_column($grademappings, 'field')) as $idnumber) {
+                $item = \grade_item::fetch(['id' => $catalogue['items'][$idnumber]['id']]);
+                if (!$item || (int)$item->courseid !== $courseid) {
+                    continue;
+                }
+                $entry = [
+                    'id' => (int)$item->id,
+                    'gradetype' => (int)$item->gradetype,
+                    'decimals' => (int)$item->get_decimals(),
+                    'grademin' => (float)$item->grademin,
+                    'grademax' => (float)$item->grademax,
+                    'scale' => [],
+                    'grades' => [],
+                ];
+                if ($entry['gradetype'] === GRADE_TYPE_SCALE) {
+                    $scale = \grade_scale::fetch(['id' => $item->scaleid]);
+                    $entry['scale'] = $scale ? array_values($scale->load_items()) : [];
+                }
+                foreach (\grade_grade::fetch_all(['itemid' => $item->id]) ?: [] as $grade) {
+                    $entry['grades'][(int)$grade->userid] = ($grade->finalgrade === null) ? null : (float)$grade->finalgrade;
+                }
+                $context->items[$idnumber] = $entry;
+            }
+
+            [$sql, $params] = get_enrolled_sql(\context_course::instance($courseid), '', 0, true);
+            $context->enrolled = array_flip(array_map('intval', $DB->get_fieldset_sql($sql, $params)));
+
+            $pulls = array_filter($grademappings, function ($m) {
+                return $m['direction'] !== 'toMonday';
+            });
+            $context->graderid = empty($pulls) ? 0 : $this->resolve_grade_grader($DB, $board);
+        } catch (\Throwable $e) {
+            $this->log($DB, $board->id, '(board)', null, null, null, null, 'error',
+                'Could not load grades from the linked course, so its grade columns were skipped this run: ' . $e->getMessage());
+            return $withoutgrades;
+        }
+
+        $this->gradecontext = $context;
+
+        // A mapped item that couldn't be loaded (removed since the
+        // catalogue was read) is skipped rather than half-processed.
+        return array_filter($mappings, function ($m) use ($context) {
+            return $m['type'] !== 'grade' || isset($context->items[$m['field']]);
+        });
+    }
+
+    /**
+     * The account grades pulled from Monday.com are recorded as, in
+     * Moodle's grade history: the account named in the "Grade sync
+     * account" setting, or the site administrator if that's empty or the
+     * account can't be found (logged, so it doesn't go unnoticed).
+     */
+    protected function resolve_grade_grader(\moodle_database $DB, \stdClass $board): int {
+        global $CFG;
+        $username = \core_text::strtolower(trim((string)get_config('local_mondaysync', 'gradegraderusername')));
+        if ($username !== '') {
+            $grader = $DB->get_record('user', ['username' => $username, 'deleted' => 0,
+                'mnethostid' => $CFG->mnet_localhost_id], 'id');
+            if ($grader) {
+                return (int)$grader->id;
+            }
+            $this->log($DB, $board->id, '(board)', null, null, null, null, 'warning',
+                'The grade sync account "' . $username . '" was not found - grades pulled from Monday.com this run are'
+                . ' recorded as the site administrator. Check the "Grade sync account" setting.');
+        }
+        return (int)get_admin()->id;
+    }
+
+    /**
+     * Moodle's current grade for a learner as text, in the one form used
+     * on both sides: points at the item's own display decimals (what the
+     * gradebook shows, with '.' as the decimal point), a scale grade as
+     * its label, or '' for no grade.
+     */
+    protected function moodle_grade_text(string $idnumber, int $userid): string {
+        $entry = $this->gradecontext->items[$idnumber];
+        $value = $entry['grades'][$userid] ?? null;
+        if ($value === null) {
+            return '';
+        }
+        if ($entry['gradetype'] === GRADE_TYPE_SCALE) {
+            return (string)($entry['scale'][(int)round($value) - 1] ?? '');
+        }
+        return $this->format_points($value, $entry['decimals']);
+    }
+
+    /**
+     * Points as text at a fixed number of decimals, with '.' as the
+     * decimal point and no thousands separator.
+     */
+    protected function format_points(float $value, int $decimals): string {
+        return number_format(round($value, $decimals), $decimals, '.', '');
+    }
+
+    /**
+     * Check a Monday.com cell's text as a grade for this item, and bring
+     * it into the same form moodle_grade_text() produces.
+     *
+     * Points must be a plain number ("34.5", not "34,5") within the
+     * item's minimum and maximum - checked here because Moodle itself
+     * would silently clip an out-of-range value to the limit
+     * (grade_item::bounded_grade()). A scale grade must be one of the
+     * scale's labels, ignoring case and surrounding spaces. Blank means
+     * no grade.
+     *
+     * @return array [canonical text or null, problem description or null]
+     */
+    protected function check_monday_grade(string $idnumber, string $text): array {
+        $entry = $this->gradecontext->items[$idnumber];
+        $text = trim($text);
+        if ($text === '') {
+            return ['', null];
+        }
+
+        if ($entry['gradetype'] === GRADE_TYPE_SCALE) {
+            foreach ($entry['scale'] as $label) {
+                if (\core_text::strtolower(trim($label)) === \core_text::strtolower($text)) {
+                    return [$label, null];
+                }
+            }
+            return [null, '"' . $text . '" is not one of this grade item\'s scale labels (' . implode(', ', $entry['scale']) . ')'];
+        }
+
+        if (!preg_match('/^-?\d+(\.\d+)?$/', $text)) {
+            return [null, '"' . $text . '" is not a number - use digits with \'.\' as the decimal point, e.g. 34.5'];
+        }
+        $value = round((float)$text, $entry['decimals']);
+        if ($value < $entry['grademin'] || $value > $entry['grademax']) {
+            return [null, '"' . $text . '" is outside this grade item\'s range of ' . $this->format_points($entry['grademin'],
+                $entry['decimals']) . ' to ' . $this->format_points($entry['grademax'], $entry['decimals'])];
+        }
+        return [$this->format_points($value, $entry['decimals']), null];
+    }
+
+    /**
+     * Write a grade from Monday.com into a manual grade item, through
+     * Moodle's own grade API (update_final_grade()), so the grade history
+     * records it - as the grade sync account - and user_graded fires.
+     *
+     * $newvalue is already in canonical form (check_monday_grade()); ''
+     * clears the grade. Refuses, by throwing (logged by the caller as an
+     * error), if the item isn't one Monday.com may write into - re-checked
+     * here against the live item, not just trusted from the saved
+     * mapping - or if the grade is locked, or if Moodle declines the write
+     * for any other reason (update_final_grade() returns false rather
+     * than throwing, e.g. for a lock date that has passed).
+     */
+    protected function write_grade(int $userid, string $idnumber, string $newvalue): void {
+        global $CFG;
+        require_once($CFG->libdir . '/gradelib.php');
+
+        $entry = $this->gradecontext->items[$idnumber] ?? null;
+        $item = $entry ? \grade_item::fetch(['id' => $entry['id']]) : false;
+        $writable = $item && (int)$item->courseid === (int)$this->gradecontext->courseid && mapping_util::is_grade_item_writable($item);
+        if (!$writable) {
+            throw new \moodle_exception('errorgradenotwritable', 'local_mondaysync', '', $idnumber);
+        }
+        if ($item->is_locked($userid)) {
+            throw new \moodle_exception('errorgradelocked', 'local_mondaysync', '', $idnumber);
+        }
+
+        if ($newvalue === '') {
+            $value = null;
+        } else if ($entry['gradetype'] === GRADE_TYPE_SCALE) {
+            $index = array_search($newvalue, $entry['scale'], true);
+            if ($index === false) {
+                throw new \moodle_exception('errorgradeinvalid', 'local_mondaysync', '', $newvalue);
+            }
+            $value = (float)($index + 1);
+        } else {
+            $value = (float)$newvalue;
+        }
+
+        $graderid = (int)$this->gradecontext->graderid;
+        $ok = $item->update_final_grade($userid, $value, 'local_mondaysync', false, FORMAT_MOODLE, $graderid ?: null);
+        if (!$ok) {
+            throw new \moodle_exception('errorgraderefused', 'local_mondaysync', '', $idnumber);
+        }
+        $this->gradecontext->items[$idnumber]['grades'][$userid] = $value;
     }
 
     protected function get_cached_value(\moodle_database $DB, string $itemid, string $columnid): ?string {

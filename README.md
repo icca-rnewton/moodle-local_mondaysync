@@ -72,7 +72,68 @@ Anything you set this way shows up correctly pre-selected next time you
 open the wizard, as long as the value matches an option the wizard
 offers (a safe standard-field whitelist plus your actual custom fields).
 
-## Notes / limitations
+## Grade sync
+
+A board can also sync grades with one course's gradebook.
+
+- **Link the board to a course** in its board settings (Connected Boards >
+  Edit > Course). A course can be linked to only one board. Duplicating a
+  course for a new run doesn't copy the board: add a new board for the new
+  course.
+- **Grade items are linked by their ID number**, not their name, so renaming
+  an item doesn't break the link. A manual item's ID number is set in
+  Gradebook setup (Edit > ID number); an activity's grade uses the
+  activity's own ID number (activity settings > Common module settings >
+  ID number); a category total's is set when editing the category. The
+  mapping wizard lists the course's items under "Grades", and explains any
+  it can't use (no ID number, an ID number shared by two items, one
+  containing a colon or longer than 100 characters, or an item with no
+  grade, such as a Text or None grade type).
+- **Directions.** Monday.com can only write into **manual** grade items with
+  no calculation. Activity grades, category and course totals, calculated
+  items and outcomes are Moodle -> Monday only - writing into an activity's
+  grade would mark it overridden, after which the activity's own grading no
+  longer reaches the gradebook. This is enforced on the server, both when a
+  mapping is saved and again before every write.
+- **Column types.** Use a Text column for any grade, a Numbers column for
+  points, or a Status column for a scale grade. For a Status column, name
+  the status options exactly as the scale's labels (including capitals):
+  the plugin writes the status by its label and never creates new options,
+  so a label the column doesn't have is rejected by Monday.com and logged.
+  Reading back, a status matches a scale label ignoring case.
+- **Values.** Points are written to Monday at the grade item's own display
+  decimal places ("Grade display decimal points"), exactly as the gradebook
+  shows them, with "." as the decimal point. A scale grade is written as its
+  label (for example "Merit"). No grade means an empty cell. A Monday
+  formula column can turn points into a percentage.
+- **Pulling from Monday.com.** The cell must hold a plain number within the
+  item's minimum and maximum (Moodle itself would silently clip anything
+  outside), or one of the scale's labels (ignoring case). Anything else is
+  refused and logged. A value with more decimals than the item displays is
+  stored rounded to the item's decimals, so Moodle and Monday show the same
+  grade. A blank cell leaves the grade alone unless "Allow clearing" is
+  ticked for that column. Locked grades are left unchanged and logged.
+  Grades are written through Moodle's grades API, so the gradebook history
+  records them and the usual "user graded" event fires.
+- **Who entered it.** The gradebook history records pulled grades as the
+  account named in the "Grade sync account" setting (for example a
+  dedicated "Monday.com Sync" account with the No login authentication
+  method and no roles), or the site administrator if that's blank or the
+  account can't be found (a warning is logged).
+- **Who is synced.** Only learners with an active enrolment in the linked
+  course; anyone else on the board still has their profile fields synced,
+  and their grade columns are skipped (logged once per row). Hidden grades
+  are synced like any other - the board is assumed to be visible to staff
+  only.
+- **Totals.** If Moodle has flagged the course as needing its grades
+  recalculated, that happens at the start of the board's sync, so totals
+  aren't stale. If the recalculation reports errors, that board's grade
+  columns are skipped for the run and the error is logged. A total that
+  depends on a grade just pulled from Monday catches up on the next poll.
+- **Privacy.** Grade values appear in the sync log and the sync cache, which
+  are exported and erased like the rest. Grades written into the gradebook
+  belong to Moodle's own grades subsystem.
+
 
 - **Orphaned mappings (deleted field or column):** if a mapped Moodle
   custom field or Monday.com column is later deleted, that mapping stops
