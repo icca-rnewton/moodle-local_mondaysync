@@ -181,6 +181,7 @@ class mapping_form extends \moodleform {
         foreach ($columns as $col) {
             $targetelname = 'target_' . $col['id'];
             $directionelname = 'direction_' . $col['id'];
+            $allowclearelname = 'allowclear_' . $col['id'];
             $label = $this->column_label($col);
 
             // This column may need one extra "orphaned" option, if its
@@ -236,6 +237,7 @@ class mapping_form extends \moodleform {
                 // orphan handling above added it via $orphangroup.
                 $mform->setDefault($targetelname, $saved['type'] . ':' . $saved['field']);
                 $mform->setDefault($directionelname, $saved['direction']);
+                $mform->setDefault($allowclearelname, !empty($saved['allowclear']) ? 1 : 0);
             }
         }
 
