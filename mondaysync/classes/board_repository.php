@@ -63,6 +63,12 @@ class board_repository {
 
         $record->timemodified = time();
 
+        // No course chosen (0 or blank from the form) is stored as null,
+        // meaning "this board doesn't sync grades".
+        if (property_exists($record, 'courseid') && empty($record->courseid)) {
+            $record->courseid = null;
+        }
+
         if (!empty($record->id)) {
             $DB->update_record('local_mondaysync_board', $record);
             return $record->id;
@@ -105,6 +111,8 @@ class board_repository {
      * @return string|null A short warning message, or null if nothing's orphaned (or it couldn't be checked).
      */
     public static function get_orphan_warning(\stdClass $board): ?string {
+        global $DB;
+
         if (empty($board->matchingcolumnid) || empty($board->fieldmappings)) {
             return null;
         }
@@ -115,9 +123,21 @@ class board_repository {
         }
 
         $customfields = mapping_util::get_custom_fields();
+
+        // The grade catalogue is only loaded if the board actually has a
+        // grade mapping. A grade mapping on a board with no course, or
+        // whose course has gone, counts as orphaned like any other.
+        $gradeitems = null;
+        $gradecoursemissing = false;
+        if (in_array('grade', array_column($rawmappings, 'type'), true)) {
+            $courseid = (int)($board->courseid ?? 0);
+            $gradeitems = mapping_util::get_grade_catalogue($courseid ?: null)['items'];
+            $gradecoursemissing = $courseid > 0 && !$DB->record_exists('course', ['id' => $courseid]);
+        }
+
         $moodleorphans = 0;
         foreach ($rawmappings as $mapping) {
-            if (!mapping_util::is_valid_field($mapping['type'], $mapping['field'], $customfields)) {
+            if (!mapping_util::is_valid_field($mapping['type'], $mapping['field'], $customfields, $gradeitems)) {
                 $moodleorphans++;
             }
         }
@@ -182,6 +202,9 @@ class board_repository {
         if ($creationproblem !== null) {
             return $creationproblem;
         }
+        if ($gradecoursemissing) {
+            return get_string('warninggradecoursemissing', 'local_mondaysync');
+        }
         if ($moodleorphans > 0 || $mondayorphans > 0) {
             return get_string('warningorphanedmappings', 'local_mondaysync', $moodleorphans + $mondayorphans);
         }
@@ -215,6 +238,27 @@ class board_repository {
             return null;
         }
         return 'https://' . $subdomain . '.monday.com/boards/' . $boardid;
+    }
+
+    /**
+     * Whether another board is already linked to this course for grade
+     * sync (at most one board per course).
+     *
+     * @param int $courseid
+     * @param int $excludeid Board record id to exclude (i.e. itself, when editing).
+     */
+    public static function courseid_in_use(int $courseid, int $excludeid = 0): bool {
+        global $DB;
+
+        $params = ['courseid' => $courseid];
+        $sql = "courseid = :courseid";
+
+        if ($excludeid > 0) {
+            $sql .= " AND id <> :excludeid";
+            $params['excludeid'] = $excludeid;
+        }
+
+        return $DB->record_exists_select('local_mondaysync_board', $sql, $params);
     }
 
     /**

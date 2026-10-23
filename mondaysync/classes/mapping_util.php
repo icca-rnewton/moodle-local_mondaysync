@@ -33,7 +33,9 @@ defined('MOODLE_INTERNAL') || die();
  *
  * Format: one mapping per line,
  * "monday_column_id => type:field:direction:allowclear", where type is one
- * of 'standard', 'custom', 'date', or 'advanced', direction is one of
+ * of MAPPING_TYPES ('standard', 'custom', 'date', 'advanced' or 'grade' -
+ * for 'grade', field is the grade item's ID number in the board's linked
+ * course), direction is one of
  * 'toMoodle' (Monday -> Moodle, the original one-way behaviour and the
  * default), 'toMonday' (Moodle -> Monday), or 'both', and allowclear is
  * '1'/'0' - whether a blank Monday value is allowed to clear the Moodle
@@ -214,6 +216,39 @@ class mapping_util {
     const STATUS_ERROR = 'Error';
 
     /**
+     * Every mapping type the saved format can hold - the one list that
+     * parsing, validation and the wizard all read, rather than each
+     * spelling the types out again.
+     *
+     * 'grade' maps a column to one grade item in the board's linked
+     * course, identified by the item's ID number (not its name, which can
+     * change, nor its database id, which differs between course runs).
+     */
+    const MAPPING_TYPES = ['standard', 'custom', 'date', 'advanced', 'grade'];
+
+    /**
+     * Grade types that hold a grade worth syncing: GRADE_TYPE_VALUE (1,
+     * points) and GRADE_TYPE_SCALE (2). GRADE_TYPE_NONE (0) and
+     * GRADE_TYPE_TEXT (3, feedback only) have no grade value at all.
+     * Literal values, since lib/grade/constants.php is only loaded with
+     * gradelib - they are fixed in core and checked against
+     * MOODLE_405_STABLE.
+     */
+    const GRADE_SYNCABLE_GRADETYPES = [1, 2];
+
+    /**
+     * The only grade item type Monday.com may ever write into. Anything
+     * else is Moodle -> Monday only, decided on the server:
+     * - activity items ('mod'): update_final_grade() marks the grade as
+     *   overridden, after which the activity's own grading (a quiz
+     *   attempt, an assignment mark) no longer reaches the gradebook;
+     * - course and category totals: Moodle calculates them itself.
+     * A manual item is still excluded if it has a calculation or is an
+     * outcome (see is_grade_item_writable()).
+     */
+    const GRADE_WRITABLE_ITEMTYPES = ['manual'];
+
+    /**
      * Interpret a piece of text from a Monday.com column as a suspended/
      * not-suspended boolean, accepting several common phrasings so Ops can
      * label their Status column however reads naturally to them, rather
@@ -282,7 +317,7 @@ class mapping_util {
             $direction = $parts[2] ?? self::DEFAULT_DIRECTION;
             $allowclear = ($parts[3] ?? '0') === '1';
 
-            if (!in_array($type, ['standard', 'custom', 'date', 'advanced'], true) || $field === '') {
+            if (!in_array($type, self::MAPPING_TYPES, true) || $field === '') {
                 continue;
             }
             if (!in_array($direction, self::DIRECTIONS, true)) {
@@ -308,8 +343,21 @@ class mapping_util {
      * executing, exactly like it already does when a custom profile
      * field gets deleted entirely. Same mental model, same machinery,
      * just one more way a field can stop being valid.
+     *
+     * A 'grade' mapping is valid only if its ID number is in the board's
+     * grade catalogue (get_grade_catalogue()['items']) and isn't shared by
+     * more than one item. Without that catalogue it is never valid -
+     * deliberately failing closed, so a caller that forgets to pass it
+     * can't execute a grade mapping by accident.
+     *
+     * @param array|null $gradeitems get_grade_catalogue()['items'] for the board's course
      */
-    public static function is_valid_field(string $type, string $field, ?array $customfields = null): bool {
+    public static function is_valid_field(string $type, string $field, ?array $customfields = null, ?array $gradeitems = null): bool {
+        if ($type === 'grade') {
+            return $gradeitems !== null && array_key_exists($field, $gradeitems)
+                && empty($gradeitems[$field]['duplicate']);
+        }
+
         $enabled = self::get_enabled_field_keys();
 
         if ($type === 'standard') {
@@ -336,9 +384,21 @@ class mapping_util {
      * sync engine all ask here rather than each keeping their own idea
      * of it.
      *
+     * For a 'grade' mapping the answer comes from the live grade item: all
+     * three directions for a writable item (a plain manual item), Moodle ->
+     * Monday only for anything else - and also for an item that isn't in
+     * the catalogue passed in, so an unknown item can never be written to.
+     *
+     * @param array|null $gradeitems get_grade_catalogue()['items'] for the board's course
      * @return string[]
      */
-    public static function get_allowed_directions(string $type, string $field): array {
+    public static function get_allowed_directions(string $type, string $field, ?array $gradeitems = null): array {
+        if ($type === 'grade') {
+            if ($gradeitems !== null && !empty($gradeitems[$field]['writable'])) {
+                return self::DIRECTIONS;
+            }
+            return ['toMonday'];
+        }
         if ($type === 'standard' && array_key_exists($field, self::STANDARD_FIELD_DIRECTIONS)) {
             return self::STANDARD_FIELD_DIRECTIONS[$field];
         }
@@ -359,8 +419,8 @@ class mapping_util {
     /**
      * Whether a direction is allowed for a given type/field.
      */
-    public static function is_direction_allowed(string $type, string $field, string $direction): bool {
-        return in_array($direction, self::get_allowed_directions($type, $field), true);
+    public static function is_direction_allowed(string $type, string $field, string $direction, ?array $gradeitems = null): bool {
+        return in_array($direction, self::get_allowed_directions($type, $field, $gradeitems), true);
     }
 
     /**
@@ -369,8 +429,8 @@ class mapping_util {
      * locked field regardless of what the browser posts - a disabled
      * <select> doesn't submit at all.
      */
-    public static function get_forced_direction(string $type, string $field): ?string {
-        $allowed = self::get_allowed_directions($type, $field);
+    public static function get_forced_direction(string $type, string $field, ?array $gradeitems = null): ?string {
+        $allowed = self::get_allowed_directions($type, $field, $gradeitems);
         return count($allowed) === 1 ? reset($allowed) : null;
     }
 
@@ -379,9 +439,13 @@ class mapping_util {
      * the same value format the mapping wizard's dropdown uses - for the
      * direction-lock script.
      *
+     * Grade items are included when the board's grade catalogue is passed,
+     * keyed 'grade:<ID number>'.
+     *
+     * @param array|null $gradeitems get_grade_catalogue()['items'] for the board's course
      * @return array ['standard:email' => 'toMonday', ...]
      */
-    public static function get_forced_directions(): array {
+    public static function get_forced_directions(?array $gradeitems = null): array {
         $out = [];
         foreach (array_keys(self::STANDARD_FIELD_DIRECTIONS) as $field) {
             $forced = self::get_forced_direction('standard', $field);
@@ -395,6 +459,12 @@ class mapping_util {
                 $out['advanced:' . $field] = $forced;
             }
         }
+        foreach (array_keys($gradeitems ?? []) as $idnumber) {
+            $forced = self::get_forced_direction('grade', (string)$idnumber, $gradeitems);
+            if ($forced !== null) {
+                $out['grade:' . $idnumber] = $forced;
+            }
+        }
         return $out;
     }
 
@@ -404,8 +474,8 @@ class mapping_util {
      * says so in the dropdown and the admin picker, not just after it's
      * been selected.
      */
-    public static function restriction_suffix(string $type, string $field): string {
-        $allowed = self::get_allowed_directions($type, $field);
+    public static function restriction_suffix(string $type, string $field, ?array $gradeitems = null): string {
+        $allowed = self::get_allowed_directions($type, $field, $gradeitems);
         if (count($allowed) >= count(self::DIRECTIONS)) {
             return '';
         }
@@ -456,24 +526,142 @@ class mapping_util {
      * excluded here (by design, for execution safety); use parse_raw() if
      * you need to see it anyway (e.g. to flag it as orphaned in the UI).
      *
-     * @return array [monday_column_id => ['type' => 'standard'|'custom'|'date'|'advanced', 'field' => string, 'direction' => string]]
+     * Grade mappings are only kept when the board's grade catalogue is
+     * passed (see parse_for_board()); without it they are excluded.
+     *
+     * @param string $raw
+     * @param array|null $gradeitems get_grade_catalogue()['items'] for the board's course
+     * @return array [monday_column_id => ['type' => one of MAPPING_TYPES, 'field' => string, 'direction' => string]]
      */
-    public static function parse(string $raw): array {
+    public static function parse(string $raw, ?array $gradeitems = null): array {
         $rawmappings = self::parse_raw($raw);
         $customfields = null;
         $out = [];
 
         foreach ($rawmappings as $columnid => $mapping) {
-            if (!in_array($mapping['type'], ['standard', 'advanced'], true) && $customfields === null) {
+            if (in_array($mapping['type'], ['custom', 'date'], true) && $customfields === null) {
                 $customfields = self::get_custom_fields();
             }
-            if (!self::is_valid_field($mapping['type'], $mapping['field'], $customfields)) {
+            if (!self::is_valid_field($mapping['type'], $mapping['field'], $customfields, $gradeitems)) {
                 continue;
             }
-            if (!self::is_direction_allowed($mapping['type'], $mapping['field'], $mapping['direction'])) {
+            if (!self::is_direction_allowed($mapping['type'], $mapping['field'], $mapping['direction'], $gradeitems)) {
                 continue;
             }
             $out[$columnid] = $mapping;
+        }
+
+        return $out;
+    }
+
+    /**
+     * parse() for a board record, loading the grade catalogue of the
+     * board's linked course (if any) so grade mappings are included.
+     */
+    public static function parse_for_board(\stdClass $board): array {
+        $catalogue = self::get_grade_catalogue(isset($board->courseid) ? (int)$board->courseid : null);
+        return self::parse((string)($board->fieldmappings ?? ''), $catalogue['items']);
+    }
+
+    /**
+     * Whether a grade item ID number can be stored in the mapping format.
+     * The format separates parts with ':' and trims each part, and lines
+     * with newlines, so an ID number containing ':', a line break or
+     * other control character, or leading/trailing spaces, would be read
+     * back as something else. Those items are listed in the wizard as
+     * unmappable rather than offered.
+     */
+    public static function is_safe_grade_idnumber(string $idnumber): bool {
+        return $idnumber !== ''
+            && $idnumber === trim($idnumber)
+            && strpos($idnumber, ':') === false
+            && !preg_match('/[\x00-\x1F\x7F]/', $idnumber);
+    }
+
+    /**
+     * Whether Monday.com may write into this grade item: a manual item,
+     * holding points or a scale, with no calculation and not an outcome.
+     * A manual item with a calculation is still calculated by Moodle, and
+     * writing into it would override that calculation.
+     *
+     * @param \grade_item $item
+     */
+    public static function is_grade_item_writable($item): bool {
+        return in_array((string)$item->itemtype, self::GRADE_WRITABLE_ITEMTYPES, true)
+            && in_array((int)$item->gradetype, self::GRADE_SYNCABLE_GRADETYPES, true)
+            && empty($item->outcomeid)
+            && !$item->is_calculated();
+    }
+
+    /**
+     * The grade items of a course that grade mappings can use, keyed by
+     * ID number, plus the items that can't be used and why (so the wizard
+     * can explain rather than silently leave them out).
+     *
+     * An item is usable when it holds a grade (points or a scale) and has
+     * a safe ID number. Moodle checks ID numbers are unique within a
+     * course when one is saved, but keeps an older duplicate rather than
+     * rejecting it, and the database doesn't enforce it - so a shared ID
+     * number is flagged 'duplicate', and mappings to it are never valid.
+     *
+     * An empty course id, the site course, or a course that no longer
+     * exists all give an empty catalogue.
+     *
+     * @param int|null $courseid
+     * @return array ['items' => [idnumber => [
+     *                    'id', 'name', 'itemtype', 'itemmodule', 'gradetype', 'scaleid',
+     *                    'writable' => bool, 'duplicate' => bool]],
+     *                'unmappable' => [['name', 'idnumber', 'reason' => 'noidnumber'|'unsafeidnumber'|'notgraded']]]
+     */
+    public static function get_grade_catalogue(?int $courseid): array {
+        global $CFG, $DB;
+
+        $out = ['items' => [], 'unmappable' => []];
+        if (empty($courseid) || $courseid == SITEID || !$DB->record_exists('course', ['id' => $courseid])) {
+            return $out;
+        }
+
+        require_once($CFG->libdir . '/gradelib.php');
+        $items = \grade_item::fetch_all(['courseid' => $courseid]);
+        if (empty($items)) {
+            return $out;
+        }
+
+        uasort($items, function ($a, $b) {
+            return ((int)$a->sortorder <=> (int)$b->sortorder) ?: ((int)$a->id <=> (int)$b->id);
+        });
+
+        foreach ($items as $item) {
+            $name = $item->get_name(true);
+            $idnumber = (string)$item->idnumber;
+
+            if (!in_array((int)$item->gradetype, self::GRADE_SYNCABLE_GRADETYPES, true)) {
+                $out['unmappable'][] = ['name' => $name, 'idnumber' => $idnumber, 'reason' => 'notgraded'];
+                continue;
+            }
+            if ($idnumber === '') {
+                $out['unmappable'][] = ['name' => $name, 'idnumber' => '', 'reason' => 'noidnumber'];
+                continue;
+            }
+            if (!self::is_safe_grade_idnumber($idnumber)) {
+                $out['unmappable'][] = ['name' => $name, 'idnumber' => $idnumber, 'reason' => 'unsafeidnumber'];
+                continue;
+            }
+            if (array_key_exists($idnumber, $out['items'])) {
+                $out['items'][$idnumber]['duplicate'] = true;
+                continue;
+            }
+
+            $out['items'][$idnumber] = [
+                'id' => (int)$item->id,
+                'name' => $name,
+                'itemtype' => (string)$item->itemtype,
+                'itemmodule' => (string)($item->itemmodule ?? ''),
+                'gradetype' => (int)$item->gradetype,
+                'scaleid' => (int)($item->scaleid ?? 0),
+                'writable' => self::is_grade_item_writable($item),
+                'duplicate' => false,
+            ];
         }
 
         return $out;
@@ -581,7 +769,17 @@ class mapping_util {
      * places (like an orphaned-mapping list) that just need to show what
      * used to be configured rather than offer it as a selectable option.
      */
-    public static function describe_mapping_target(array $mapping, ?array $customfields = null): string {
+    public static function describe_mapping_target(array $mapping, ?array $customfields = null, ?array $gradeitems = null): string {
+        if ($mapping['type'] === 'grade') {
+            if ($gradeitems !== null && array_key_exists($mapping['field'], $gradeitems)) {
+                $a = new \stdClass();
+                $a->name = $gradeitems[$mapping['field']]['name'];
+                $a->idnumber = s($mapping['field']);
+                return get_string('gradeitemoption', 'local_mondaysync', $a);
+            }
+            return get_string('deletedgradeitemdesc', 'local_mondaysync', s($mapping['field']));
+        }
+
         if ($mapping['type'] === 'standard') {
             return get_string('standardfieldoption', 'local_mondaysync', $mapping['field']);
         }

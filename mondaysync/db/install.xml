@@ -22,6 +22,7 @@
         <FIELD NAME="createemailpassword" TYPE="int" LENGTH="1" NOTNULL="true" DEFAULT="0" SEQUENCE="false" COMMENT="Whether new manual-auth accounts are emailed a generated password"/>
         <FIELD NAME="createtenantcolumnid" TYPE="char" LENGTH="100" NOTNULL="false" SEQUENCE="false" COMMENT="Optional Monday.com column holding a Moodle Workplace tenant name, per row"/>
         <FIELD NAME="createdefaulttenantid" TYPE="int" LENGTH="10" NOTNULL="false" SEQUENCE="false" COMMENT="Moodle Workplace tool_tenant.id used when the per-row tenant column is blank or unmatched"/>
+        <FIELD NAME="courseid" TYPE="int" LENGTH="10" NOTNULL="false" SEQUENCE="false" COMMENT="Course whose gradebook this board syncs grades with (grade mappings); null if the board doesn't sync grades. At most one board per course, checked by the board form"/>
         <FIELD NAME="timecreated" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false"/>
         <FIELD NAME="timemodified" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false"/>
       </FIELDS>
@@ -30,6 +31,7 @@
       </KEYS>
       <INDEXES>
         <INDEX NAME="boardid" UNIQUE="true" FIELDS="boardid"/>
+        <INDEX NAME="courseid" UNIQUE="false" FIELDS="courseid"/>
       </INDEXES>
     </TABLE>
     <TABLE NAME="local_mondaysync_cache" COMMENT="Last-seen value per Monday.com item/column, used to detect changes between polls. userid is denormalised here (2026, Titus review #17) specifically so GDPR export/delete requests can find a user's cache rows directly, rather than needing to trace back through log history that's subject to its own retention purge and can be gone by the time a request is processed.">

@@ -47,6 +47,17 @@ class board_form extends \moodleform {
         $mform->setDefault('enabled', 1);
         $mform->addElement('static', 'enabled_desc', '', get_string('boardenabled_desc', 'local_mondaysync'));
 
+        // Grade sync: the course whose gradebook this board's grade
+        // mappings use. Optional - a board that only syncs profile fields
+        // leaves it empty.
+        $mform->addElement('course', 'courseid', get_string('boardcourse', 'local_mondaysync'), [
+            'multiple' => false,
+            'exclude' => [SITEID],
+            'noselectionstring' => get_string('boardcoursenone', 'local_mondaysync'),
+        ]);
+        $mform->setType('courseid', PARAM_INT);
+        $mform->addElement('static', 'courseid_desc', '', get_string('boardcourse_desc', 'local_mondaysync'));
+
         $mform->addElement('hidden', 'id');
         $mform->setType('id', PARAM_INT);
 
@@ -63,6 +74,20 @@ class board_form extends \moodleform {
                 $errors['boardid'] = get_string('invalidboardid', 'local_mondaysync');
             } else if (\local_mondaysync\board_repository::boardid_in_use($parsed['boardid'], (int)($data['id'] ?? 0))) {
                 $errors['boardid'] = get_string('boardidduplicate', 'local_mondaysync');
+            }
+        }
+
+        // One board per course: two boards pulling Monday values into the
+        // same manual grade item would overwrite each other on every poll,
+        // with no right answer to pick between them - so the ambiguous
+        // configuration is refused here, before it can be saved.
+        $courseid = (int)($data['courseid'] ?? 0);
+        if ($courseid > 0) {
+            global $DB;
+            if ($courseid == SITEID || !$DB->record_exists('course', ['id' => $courseid])) {
+                $errors['courseid'] = get_string('boardcourseinvalid', 'local_mondaysync');
+            } else if (\local_mondaysync\board_repository::courseid_in_use($courseid, (int)($data['id'] ?? 0))) {
+                $errors['courseid'] = get_string('boardcourseinuse', 'local_mondaysync');
             }
         }
 

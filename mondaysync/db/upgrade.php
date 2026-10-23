@@ -303,5 +303,34 @@ function xmldb_local_mondaysync_upgrade($oldversion) {
         upgrade_plugin_savepoint(true, 2026101305, 'local', 'mondaysync');
     }
 
+    if ($oldversion < 2026102300) {
+        // Grade sync: each board can be linked to one course, whose
+        // gradebook its grade mappings read from and write to. Existing
+        // boards get no course (null), so nothing they already do changes,
+        // and no saved data needs migrating - no grade mappings existed
+        // before this version.
+        //
+        // The index is deliberately not unique: several boards have no
+        // course (null), and not every supported database allows repeated
+        // nulls in a unique index. "One board per course" is checked by
+        // the board form instead.
+        //
+        // Both steps check first, so running this again (an interrupted
+        // upgrade, or a redeploy) changes nothing.
+        $table = new xmldb_table('local_mondaysync_board');
+
+        $field = new xmldb_field('courseid', XMLDB_TYPE_INTEGER, '10', null, null, null, null, 'createdefaulttenantid');
+        if (!$dbman->field_exists($table, $field)) {
+            $dbman->add_field($table, $field);
+        }
+
+        $index = new xmldb_index('courseid', XMLDB_INDEX_NOTUNIQUE, ['courseid']);
+        if (!$dbman->index_exists($table, $index)) {
+            $dbman->add_index($table, $index);
+        }
+
+        upgrade_plugin_savepoint(true, 2026102300, 'local', 'mondaysync');
+    }
+
     return true;
 }

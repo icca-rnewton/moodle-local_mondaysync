@@ -101,6 +101,16 @@ if ($action === 'add' || $action === 'edit') {
         $parsed = \local_mondaysync\board_repository::parse_board_input($data->boardid);
         $data->boardid = $parsed['boardid'];
 
+        // The course picker is an AJAX autocomplete. If its selection is
+        // removed, the browser may post nothing for it at all, and
+        // moodleform's autocomplete then falls back to the value the form
+        // was loaded with (MoodleQuickForm_autocomplete::exportValue(),
+        // checked against MOODLE_405_STABLE) - so clearing the course
+        // would silently keep the old one. Read what was actually posted:
+        // nothing posted means no course. The form's validation() has
+        // already run, and get_data() has already checked the sesskey.
+        $data->courseid = optional_param('courseid', 0, PARAM_INT);
+
         // If they pasted a full URL and we don't have an account subdomain
         // yet, learn it automatically rather than making them set it separately.
         if ($parsed['subdomain'] && trim((string) get_config('local_mondaysync', 'accountsubdomain')) === '') {
@@ -150,13 +160,30 @@ if (empty($boards)) {
     $table->head = [
         get_string('boardname', 'local_mondaysync'),
         get_string('boardid', 'local_mondaysync'),
+        get_string('boardcourse', 'local_mondaysync'),
         get_string('col_status', 'local_mondaysync'),
         get_string('mappingsconfigured', 'local_mondaysync'),
         '',
     ];
 
+    // Linked courses for the list, in one query rather than one per board.
+    $courseids = array_filter(array_map(function ($b) {
+        return (int)($b->courseid ?? 0);
+    }, $boards));
+    $courses = $courseids ? $DB->get_records_list('course', 'id', array_unique($courseids), '', 'id, fullname') : [];
+
     foreach ($boards as $board) {
-        $mappedcount = count(\local_mondaysync\mapping_util::parse((string)$board->fieldmappings));
+        $mappedcount = count(\local_mondaysync\mapping_util::parse_for_board($board));
+
+        $courseid = (int)($board->courseid ?? 0);
+        if ($courseid === 0) {
+            $coursecell = html_writer::span(get_string('boardcoursenone', 'local_mondaysync'), 'text-muted');
+        } else if (isset($courses[$courseid])) {
+            $coursename = format_string($courses[$courseid]->fullname, true, ['context' => context_course::instance($courseid)]);
+            $coursecell = html_writer::link(new moodle_url('/course/view.php', ['id' => $courseid]), $coursename);
+        } else {
+            $coursecell = html_writer::span(get_string('boardcoursedeleted', 'local_mondaysync', $courseid), 'text-danger');
+        }
 
         $orphanwarning = \local_mondaysync\board_repository::get_orphan_warning($board);
 
@@ -199,6 +226,7 @@ if (empty($boards)) {
         $table->data[] = [
             $namecell,
             s($board->boardid),
+            $coursecell,
             $status,
             $board->matchingcolumnid ? $mappedcount : get_string('notconfigured', 'local_mondaysync'),
             implode(' | ', $links),
